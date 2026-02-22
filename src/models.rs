@@ -23,3 +23,56 @@ pub fn compute_hash(parts: &[&str]) -> String {
     }
     hex::encode(hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_hash_deterministic() {
+        let h1 = compute_hash(&["a", "b", "c"]);
+        let h2 = compute_hash(&["a", "b", "c"]);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_different_order() {
+        let h1 = compute_hash(&["a", "b"]);
+        let h2 = compute_hash(&["b", "a"]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_empty_input() {
+        let h = compute_hash(&[]);
+        assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn compute_hash_empty_strings() {
+        let h1 = compute_hash(&[""]);
+        let h2 = compute_hash(&["", ""]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_hex_output() {
+        let h = compute_hash(&["test"]);
+        assert_eq!(h.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn import_stats_default() {
+        let stats = ImportStats::default();
+        assert_eq!(stats.records, 0);
+        assert_eq!(stats.workouts, 0);
+        assert_eq!(stats.activity_summaries, 0);
+        assert_eq!(stats.correlations, 0);
+        assert_eq!(stats.ecg_readings, 0);
+        assert_eq!(stats.route_points, 0);
+        assert_eq!(stats.metadata_entries, 0);
+        assert_eq!(stats.workout_events, 0);
+        assert_eq!(stats.workout_statistics, 0);
+    }
+}

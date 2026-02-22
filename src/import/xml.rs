@@ -83,7 +83,8 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                     b"Record" if !in_correlation => {
                         let record_type = attr_value(e, b"type").unwrap_or_default();
                         let source_name = attr_value(e, b"sourceName").unwrap_or_default();
-                        let start_date = clean_date(&attr_value(e, b"startDate").unwrap_or_default());
+                        let start_date =
+                            clean_date(&attr_value(e, b"startDate").unwrap_or_default());
                         let end_date = clean_date(&attr_value(e, b"endDate").unwrap_or_default());
                         let value_str = attr_value(e, b"value");
                         let unit = attr_value(e, b"unit");
@@ -150,7 +151,8 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         let activity_type =
                             attr_value(e, b"workoutActivityType").unwrap_or_default();
                         let source_name = attr_value(e, b"sourceName").unwrap_or_default();
-                        let start_date = clean_date(&attr_value(e, b"startDate").unwrap_or_default());
+                        let start_date =
+                            clean_date(&attr_value(e, b"startDate").unwrap_or_default());
                         let end_date = clean_date(&attr_value(e, b"endDate").unwrap_or_default());
                         let duration_str = attr_value(e, b"duration");
                         let duration = parse_opt_f64(&duration_str);
@@ -170,9 +172,10 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             duration_unit: attr_value(e, b"durationUnit"),
                             total_distance: parse_opt_f64(&attr_value(e, b"totalDistance")),
                             total_distance_unit: attr_value(e, b"totalDistanceUnit"),
-                            total_energy_burned: parse_opt_f64(
-                                &attr_value(e, b"totalEnergyBurned"),
-                            ),
+                            total_energy_burned: parse_opt_f64(&attr_value(
+                                e,
+                                b"totalEnergyBurned",
+                            )),
                             total_energy_unit: attr_value(e, b"totalEnergyBurnedUnit"),
                             source_name,
                             source_version: attr_value(e, b"sourceVersion"),
@@ -219,26 +222,32 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         let date_comp = attr_value(e, b"dateComponents").unwrap_or_default();
                         activity_batch.push(ActivityRow {
                             date_components: date_comp,
-                            active_energy_burned: parse_opt_f64(
-                                &attr_value(e, b"activeEnergyBurned"),
-                            ),
-                            active_energy_burned_goal: parse_opt_f64(
-                                &attr_value(e, b"activeEnergyBurnedGoal"),
-                            ),
+                            active_energy_burned: parse_opt_f64(&attr_value(
+                                e,
+                                b"activeEnergyBurned",
+                            )),
+                            active_energy_burned_goal: parse_opt_f64(&attr_value(
+                                e,
+                                b"activeEnergyBurnedGoal",
+                            )),
                             apple_move_time: parse_opt_f64(&attr_value(e, b"appleMoveTime")),
-                            apple_move_time_goal: parse_opt_f64(
-                                &attr_value(e, b"appleMoveTimeGoal"),
-                            ),
-                            apple_exercise_time: parse_opt_f64(
-                                &attr_value(e, b"appleExerciseTime"),
-                            ),
-                            apple_exercise_time_goal: parse_opt_f64(
-                                &attr_value(e, b"appleExerciseTimeGoal"),
-                            ),
+                            apple_move_time_goal: parse_opt_f64(&attr_value(
+                                e,
+                                b"appleMoveTimeGoal",
+                            )),
+                            apple_exercise_time: parse_opt_f64(&attr_value(
+                                e,
+                                b"appleExerciseTime",
+                            )),
+                            apple_exercise_time_goal: parse_opt_f64(&attr_value(
+                                e,
+                                b"appleExerciseTimeGoal",
+                            )),
                             apple_stand_hours: parse_opt_f64(&attr_value(e, b"appleStandHours")),
-                            apple_stand_hours_goal: parse_opt_f64(
-                                &attr_value(e, b"appleStandHoursGoal"),
-                            ),
+                            apple_stand_hours_goal: parse_opt_f64(&attr_value(
+                                e,
+                                b"appleStandHoursGoal",
+                            )),
                             import_id: import_id.to_string(),
                         });
                         stats.activity_summaries += 1;
@@ -523,4 +532,115 @@ fn flush_activities(conn: &Connection, batch: &mut Vec<ActivityRow>) -> Result<(
     appender.flush()?;
     batch.clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ensure_schema, open_db_in_memory};
+
+    #[test]
+    fn clean_date_strips_positive_offset() {
+        assert_eq!(
+            clean_date("2020-06-20 16:56:44 +0000"),
+            "2020-06-20 16:56:44"
+        );
+    }
+
+    #[test]
+    fn clean_date_strips_negative_offset() {
+        assert_eq!(
+            clean_date("2020-06-20 16:56:44 -0500"),
+            "2020-06-20 16:56:44"
+        );
+    }
+
+    #[test]
+    fn clean_date_no_offset() {
+        assert_eq!(clean_date("2020-06-20 16:56:44"), "2020-06-20 16:56:44");
+    }
+
+    #[test]
+    fn clean_date_opt_some() {
+        let s = Some("2020-06-20 16:56:44 +0000".to_string());
+        assert_eq!(clean_date_opt(&s), Some("2020-06-20 16:56:44".to_string()));
+    }
+
+    #[test]
+    fn clean_date_opt_none() {
+        assert_eq!(clean_date_opt(&None), None);
+    }
+
+    #[test]
+    fn parse_opt_f64_valid() {
+        let s = Some("72.5".to_string());
+        assert_eq!(parse_opt_f64(&s), Some(72.5));
+    }
+
+    #[test]
+    fn parse_opt_f64_invalid() {
+        let s = Some("not_a_number".to_string());
+        assert_eq!(parse_opt_f64(&s), None);
+    }
+
+    #[test]
+    fn parse_opt_f64_none() {
+        assert_eq!(parse_opt_f64(&None), None);
+    }
+
+    #[test]
+    fn import_xml_minimal() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE HealthData>
+<HealthData locale="en_US">
+ <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="Watch" unit="count/min" value="72" startDate="2024-01-01 08:00:00 +0000" endDate="2024-01-01 08:01:00 +0000">
+  <MetadataEntry key="HKMetadataKeyHeartRateMotionContext" value="1"/>
+ </Record>
+ <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Phone" unit="count" value="100" startDate="2024-01-01 09:00:00 +0000" endDate="2024-01-01 09:30:00 +0000"/>
+ <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30.5" durationUnit="min" totalDistance="5.0" totalDistanceUnit="km" totalEnergyBurned="300" totalEnergyBurnedUnit="kcal" sourceName="Watch" startDate="2024-01-01 10:00:00 +0000" endDate="2024-01-01 10:30:00 +0000">
+  <WorkoutEvent type="HKWorkoutEventTypeLap" date="2024-01-01 10:15:00 +0000"/>
+  <WorkoutStatistics type="HKQuantityTypeIdentifierHeartRate" startDate="2024-01-01 10:00:00 +0000" endDate="2024-01-01 10:30:00 +0000" average="150" minimum="120" maximum="180" unit="count/min"/>
+  <WorkoutRoute sourceName="Watch">
+   <FileReference path="/workout-routes/route_2024-01-01.gpx"/>
+  </WorkoutRoute>
+ </Workout>
+ <Correlation type="HKCorrelationTypeIdentifierBloodPressure" sourceName="BP" startDate="2024-01-01 12:00:00 +0000" endDate="2024-01-01 12:00:00 +0000">
+  <Record type="HKQuantityTypeIdentifierBloodPressureSystolic" sourceName="BP" unit="mmHg" value="120" startDate="2024-01-01 12:00:00 +0000" endDate="2024-01-01 12:00:00 +0000"/>
+ </Correlation>
+ <ActivitySummary dateComponents="2024-01-01" activeEnergyBurned="500" activeEnergyBurnedGoal="600" appleExerciseTime="30" appleExerciseTimeGoal="30" appleStandHours="10" appleStandHoursGoal="12"/>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_import").unwrap();
+
+        assert_eq!(stats.records, 2); // correlation child skipped
+        assert_eq!(stats.workouts, 1);
+        assert_eq!(stats.activity_summaries, 1);
+        assert_eq!(stats.correlations, 1);
+        assert_eq!(stats.metadata_entries, 1);
+        assert_eq!(stats.workout_events, 1);
+        assert_eq!(stats.workout_statistics, 1);
+
+        // Verify data in DB
+        let rec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rec_count, 2);
+
+        let workout_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workouts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(workout_count, 1);
+
+        let meta_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM record_metadata", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(meta_count, 1);
+    }
 }

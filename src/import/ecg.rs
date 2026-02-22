@@ -15,7 +15,7 @@ pub fn import_ecg_files(conn: &Connection, ecg_dir: &Path, import_id: &str) -> R
     let mut count = 0u64;
     let mut entries: Vec<_> = fs::read_dir(ecg_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "csv"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "csv"))
         .collect();
     entries.sort_by_key(|e| e.path());
 
@@ -33,7 +33,7 @@ pub fn import_ecg_files(conn: &Connection, ecg_dir: &Path, import_id: &str) -> R
     Ok(count)
 }
 
-fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str) -> Result<()> {
+pub(crate) fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str) -> Result<()> {
     let content = fs::read_to_string(path).context("Failed to read ECG file")?;
     let mut lines = content.lines();
 
@@ -70,16 +70,22 @@ fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str) -> Result<
                 raw.to_string()
             };
         } else if line.starts_with("Classification,") {
-            classification =
-                Some(line.strip_prefix("Classification,").unwrap_or("").to_string());
+            classification = Some(
+                line.strip_prefix("Classification,")
+                    .unwrap_or("")
+                    .to_string(),
+            );
         } else if line.starts_with("Symptoms,") {
             let s = line.strip_prefix("Symptoms,").unwrap_or("").to_string();
             if !s.is_empty() {
                 symptoms = Some(s);
             }
         } else if line.starts_with("Software Version,") {
-            software_version =
-                Some(line.strip_prefix("Software Version,").unwrap_or("").to_string());
+            software_version = Some(
+                line.strip_prefix("Software Version,")
+                    .unwrap_or("")
+                    .to_string(),
+            );
         } else if line.starts_with("Device,") {
             let d = line.strip_prefix("Device,").unwrap_or("").to_string();
             // Remove surrounding quotes
@@ -87,7 +93,10 @@ fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str) -> Result<
         } else if line.starts_with("Sample Rate,") {
             let sr_str = line.strip_prefix("Sample Rate,").unwrap_or("");
             // Extract numeric part: "513.992 hertz" -> 513.992
-            sample_rate_hz = sr_str.split_whitespace().next().and_then(|s| s.parse().ok());
+            sample_rate_hz = sr_str
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok());
         } else if line.starts_with("Lead,") || line.starts_with("Unit,") {
             // Skip these header lines
             continue;
@@ -141,4 +150,95 @@ fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str) -> Result<
     appender.flush()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ensure_schema, open_db_in_memory};
+
+    const MINIMAL_ECG_CSV: &str = "Name,Test User
+Date of Birth,1990-01-01
+Recorded Date,2024-06-15 10:30:00 +0000
+Classification,Sinus Rhythm
+Symptoms,None
+Software Version,2.0
+Device,\"Apple Watch\"
+Sample Rate,512.000 Hz
+Lead,Lead I
+Unit,µV
+
+100
+200
+-50
+150
+75";
+
+    #[test]
+    fn import_single_ecg_minimal() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ecg_path = dir.path().join("ecg_2024.csv");
+        std::fs::write(&ecg_path, MINIMAL_ECG_CSV).unwrap();
+
+        import_single_ecg(&conn, &ecg_path, "test_import").unwrap();
+
+        let reading_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ecg_readings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reading_count, 1);
+
+        let sample_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ecg_samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sample_count, 5);
+
+        let classification: String = conn
+            .query_row(
+                "SELECT classification FROM ecg_readings LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(classification, "Sinus Rhythm");
+    }
+
+    #[test]
+    fn import_ecg_missing_date() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let csv = "Name,Test\nClassification,Normal\n\n100\n200\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_ecg.csv");
+        std::fs::write(&path, csv).unwrap();
+
+        let result = import_single_ecg(&conn, &path, "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No recorded date"));
+    }
+
+    #[test]
+    fn import_ecg_files_missing_dir() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let missing = std::path::PathBuf::from("/nonexistent/path/ecgs");
+        let count = import_ecg_files(&conn, &missing, "test").unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn import_ecg_files_with_csvs() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ecg1.csv"), MINIMAL_ECG_CSV).unwrap();
+
+        let count = import_ecg_files(&conn, dir.path(), "test").unwrap();
+        assert_eq!(count, 1);
+    }
 }

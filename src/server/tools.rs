@@ -5,7 +5,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryRecordsParams {
-    #[schemars(description = "The health record type to query, e.g. HKQuantityTypeIdentifierHeartRate")]
+    #[schemars(
+        description = "The health record type to query, e.g. HKQuantityTypeIdentifierHeartRate"
+    )]
     pub record_type: String,
     #[schemars(description = "Start date filter (ISO 8601 / YYYY-MM-DD)")]
     pub start_date: Option<String>,

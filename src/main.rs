@@ -1,8 +1,4 @@
-mod db;
-mod import;
-mod models;
-mod server;
-
+use apple_health_mcp::{import, server};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;

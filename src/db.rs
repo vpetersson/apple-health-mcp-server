@@ -224,3 +224,108 @@ pub fn rebuild_daily_stats(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+pub fn open_db_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch("PRAGMA threads=4;")?;
+    Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> Connection {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn schema_creation() {
+        let conn = setup();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // records, record_metadata, workouts, workout_events, workout_statistics,
+        // activity_summaries, ecg_readings, ecg_samples, route_points, imports = 10
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn schema_idempotent() {
+        let conn = setup();
+        ensure_schema(&conn).unwrap(); // second call should not fail
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn deduplication() {
+        let conn = setup();
+        // Insert duplicate records
+        conn.execute_batch(
+            "
+            INSERT INTO records VALUES ('hash1', 'HeartRate', 72.0, 'count/min', 'Watch', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
+            INSERT INTO records VALUES ('hash1', 'HeartRate', 72.0, 'count/min', 'Watch', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
+            INSERT INTO records VALUES ('hash2', 'StepCount', 100.0, 'count', 'Phone', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
+            ",
+        )
+        .unwrap();
+
+        deduplicate_tables(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn daily_stats_aggregation() {
+        let conn = setup();
+        conn.execute_batch(
+            "
+            INSERT INTO records VALUES ('h1', 'HeartRate', 72.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
+            INSERT INTO records VALUES ('h2', 'HeartRate', 80.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 09:00:00', '2024-01-01 09:01:00', 'imp1');
+            INSERT INTO records VALUES ('h3', 'HeartRate', 65.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-02 08:00:00', '2024-01-02 08:01:00', 'imp1');
+            ",
+        )
+        .unwrap();
+
+        rebuild_daily_stats(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM daily_record_stats", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2); // 2 days
+
+        let avg: f64 = conn
+            .query_row(
+                "SELECT avg_value FROM daily_record_stats WHERE date = '2024-01-01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((avg - 76.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn open_db_in_memory_works() {
+        let conn = open_db_in_memory().unwrap();
+        let result: i64 = conn.query_row("SELECT 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(result, 1);
+    }
+}

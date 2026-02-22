@@ -23,7 +23,7 @@ pub fn import_gpx_files(
     let mut total_points = 0u64;
     let mut entries: Vec<_> = fs::read_dir(routes_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "gpx"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "gpx"))
         .collect();
     entries.sort_by_key(|e| e.path());
 
@@ -64,7 +64,7 @@ fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> 
     })
 }
 
-fn import_single_gpx(
+pub(crate) fn import_single_gpx(
     conn: &Connection,
     path: &Path,
     import_id: &str,
@@ -108,11 +108,8 @@ fn import_single_gpx(
                         h_accuracy = None;
                         v_accuracy = None;
                     }
-                    b"ele" | b"time" | b"speed" | b"course" | b"hAcc" | b"vAcc"
-                        if in_trkpt =>
-                    {
-                        current_tag =
-                            Some(String::from_utf8_lossy(local.as_ref()).to_string());
+                    b"ele" | b"time" | b"speed" | b"course" | b"hAcc" | b"vAcc" if in_trkpt => {
+                        current_tag = Some(String::from_utf8_lossy(local.as_ref()).to_string());
                     }
                     _ => {}
                 }
@@ -136,12 +133,8 @@ fn import_single_gpx(
                 if local.as_ref() == b"trkpt" && in_trkpt {
                     if let (Some(lat_v), Some(lon_v), Some(ref ts)) = (lat, lon, &timestamp) {
                         let wh = workout_hash.unwrap_or("");
-                        let point_hash = compute_hash(&[
-                            wh,
-                            ts,
-                            &lat_v.to_string(),
-                            &lon_v.to_string(),
-                        ]);
+                        let point_hash =
+                            compute_hash(&[wh, ts, &lat_v.to_string(), &lon_v.to_string()]);
 
                         // Clean timestamp for DuckDB (strip timezone suffix)
                         let clean_ts = clean_timestamp(ts);
@@ -182,7 +175,7 @@ fn import_single_gpx(
 
 /// Strip timezone info from GPX timestamps for DuckDB TIMESTAMP compatibility.
 /// Handles ISO 8601 formats like "2020-06-20T16:56:44Z" or "2020-06-20T16:56:44+00:00"
-fn clean_timestamp(ts: &str) -> String {
+pub(crate) fn clean_timestamp(ts: &str) -> String {
     let s = ts.trim();
     // Remove trailing 'Z'
     let s = s.strip_suffix('Z').unwrap_or(s);
@@ -199,4 +192,132 @@ fn clean_timestamp(ts: &str) -> String {
     };
     // Replace 'T' with space for DuckDB
     s.replace('T', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ensure_schema, open_db_in_memory};
+    use std::collections::HashMap;
+
+    #[test]
+    fn clean_timestamp_z_suffix() {
+        assert_eq!(
+            clean_timestamp("2020-06-20T16:56:44Z"),
+            "2020-06-20 16:56:44"
+        );
+    }
+
+    #[test]
+    fn clean_timestamp_positive_offset() {
+        assert_eq!(
+            clean_timestamp("2020-06-20T16:56:44+00:00"),
+            "2020-06-20 16:56:44"
+        );
+    }
+
+    #[test]
+    fn clean_timestamp_negative_offset() {
+        assert_eq!(
+            clean_timestamp("2020-06-20T16:56:44-05:00"),
+            "2020-06-20 16:56:44"
+        );
+    }
+
+    #[test]
+    fn clean_timestamp_no_tz() {
+        assert_eq!(
+            clean_timestamp("2020-06-20T16:56:44"),
+            "2020-06-20 16:56:44"
+        );
+    }
+
+    #[test]
+    fn clean_timestamp_short_string() {
+        assert_eq!(clean_timestamp("12:00"), "12:00");
+    }
+
+    #[test]
+    fn import_single_gpx_minimal() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let gpx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
+  <trk>
+    <trkseg>
+      <trkpt lat="37.7749" lon="-122.4194">
+        <ele>10.5</ele>
+        <time>2024-01-01T10:00:00Z</time>
+        <speed>3.5</speed>
+        <course>180.0</course>
+        <hAcc>5.0</hAcc>
+        <vAcc>3.0</vAcc>
+      </trkpt>
+      <trkpt lat="37.7750" lon="-122.4195">
+        <ele>11.0</ele>
+        <time>2024-01-01T10:00:05Z</time>
+        <speed>3.6</speed>
+        <course>181.0</course>
+        <hAcc>4.5</hAcc>
+        <vAcc>2.8</vAcc>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gpx_path = dir.path().join("route.gpx");
+        std::fs::write(&gpx_path, gpx).unwrap();
+
+        let count =
+            import_single_gpx(&conn, &gpx_path, "test_import", Some("workout_hash_1")).unwrap();
+        assert_eq!(count, 2);
+
+        let db_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM route_points", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(db_count, 2);
+
+        let wh: String = conn
+            .query_row("SELECT workout_hash FROM route_points LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(wh, "workout_hash_1");
+    }
+
+    #[test]
+    fn import_gpx_files_missing_dir() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let missing = std::path::PathBuf::from("/nonexistent/path/routes");
+        let map = HashMap::new();
+        let count = import_gpx_files(&conn, &missing, "test", &map).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn import_gpx_no_workout_hash() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let gpx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
+  <trk><trkseg>
+    <trkpt lat="37.0" lon="-122.0">
+      <ele>5.0</ele>
+      <time>2024-01-01T10:00:00Z</time>
+    </trkpt>
+  </trkseg></trk>
+</gpx>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gpx_path = dir.path().join("route.gpx");
+        std::fs::write(&gpx_path, gpx).unwrap();
+
+        let count = import_single_gpx(&conn, &gpx_path, "test_import", None).unwrap();
+        assert_eq!(count, 1);
+    }
 }

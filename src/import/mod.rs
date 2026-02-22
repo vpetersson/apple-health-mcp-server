@@ -115,8 +115,7 @@ fn build_workout_route_map(
                 match local.as_slice() {
                     b"Workout" => {
                         in_workout = true;
-                        let activity_type =
-                            attr_val(e, b"workoutActivityType").unwrap_or_default();
+                        let activity_type = attr_val(e, b"workoutActivityType").unwrap_or_default();
                         let source_name = attr_val(e, b"sourceName").unwrap_or_default();
                         let start_date = attr_val(e, b"startDate").unwrap_or_default();
                         let end_date = attr_val(e, b"endDate").unwrap_or_default();
