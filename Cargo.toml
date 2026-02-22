@@ -2,6 +2,7 @@
 name = "apple-health-mcp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "apple_health_mcp"
