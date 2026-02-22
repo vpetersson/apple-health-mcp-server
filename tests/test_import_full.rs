@@ -3,6 +3,7 @@ mod common;
 use apple_health_mcp::db::{deduplicate_tables, ensure_schema, open_db, rebuild_daily_stats};
 use apple_health_mcp::import::ecg::import_ecg_files;
 use apple_health_mcp::import::gpx::import_gpx_files;
+use apple_health_mcp::import::run_import;
 use apple_health_mcp::import::xml::import_xml;
 use std::collections::HashMap;
 
@@ -149,4 +150,89 @@ fn import_idempotent_with_dedup() {
         .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
         .unwrap();
     assert_eq!(after, 2);
+}
+
+/// Test the top-level `run_import()` which exercises the full pipeline including
+/// `build_workout_route_map()` internally.
+#[test]
+fn run_import_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_dir = dir.path().join("apple_health_export");
+    std::fs::create_dir_all(&export_dir).unwrap();
+
+    // Write export.xml
+    std::fs::write(export_dir.join("export.xml"), common::MINIMAL_XML).unwrap();
+
+    // Write ECG files
+    let ecg_dir = export_dir.join("electrocardiograms");
+    std::fs::create_dir_all(&ecg_dir).unwrap();
+    std::fs::write(ecg_dir.join("ecg_2024.csv"), common::MINIMAL_ECG_CSV).unwrap();
+
+    // Write GPX files
+    let gpx_dir = export_dir.join("workout-routes");
+    std::fs::create_dir_all(&gpx_dir).unwrap();
+    std::fs::write(gpx_dir.join("route_2024-01-01.gpx"), common::MINIMAL_GPX).unwrap();
+
+    let db_path = dir.path().join("import_test.duckdb");
+
+    // run_import covers: open_db, ensure_schema, import_xml, build_workout_route_map,
+    // import_ecg_files, import_gpx_files, deduplicate_tables, rebuild_daily_stats,
+    // and the imports table INSERT.
+    run_import(&export_dir, &db_path).unwrap();
+
+    // Verify DB was created and populated
+    let conn = open_db(&db_path).unwrap();
+
+    let record_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(record_count, 2);
+
+    let workout_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM workouts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(workout_count, 1);
+
+    let route_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM route_points", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(route_count, 2);
+
+    let ecg_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ecg_readings", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ecg_count, 1);
+
+    // Verify import metadata was logged
+    let import_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(import_count, 1);
+
+    // Verify daily stats were built
+    let daily_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM daily_record_stats", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(daily_count > 0);
+}
+
+/// Test run_import with no ECG or GPX directories (graceful handling)
+#[test]
+fn run_import_xml_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_dir = dir.path().join("export");
+    std::fs::create_dir_all(&export_dir).unwrap();
+    std::fs::write(export_dir.join("export.xml"), common::MINIMAL_XML).unwrap();
+    // No electrocardiograms/ or workout-routes/ directories
+
+    let db_path = dir.path().join("xml_only.duckdb");
+    run_import(&export_dir, &db_path).unwrap();
+
+    let conn = open_db(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
 }

@@ -818,4 +818,172 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 1);
     }
+
+    #[test]
+    fn query_to_json_unsigned_int_types() {
+        let server = setup_server();
+        let result = server
+            .query_to_json(
+                "SELECT 42::UTINYINT AS ut, 1000::USMALLINT AS us, 100000::UINTEGER AS ui, 999999999::UBIGINT AS ub",
+                &[],
+            )
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        let obj = arr[0].as_object().unwrap();
+        assert_eq!(obj["ut"], json!(42));
+        assert_eq!(obj["us"], json!(1000));
+        assert_eq!(obj["ui"], json!(100000));
+        assert_eq!(obj["ub"], json!(999999999));
+    }
+
+    #[test]
+    fn query_to_json_hugeint() {
+        let server = setup_server();
+        // Small value that fits in i64
+        let result = server
+            .query_to_json("SELECT 123::HUGEINT AS h", &[])
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr[0].get("h").unwrap(), 123);
+
+        // Large value that exceeds i64 range → returned as string
+        let result = server
+            .query_to_json(
+                "SELECT 170141183460469231731687303715884105727::HUGEINT AS h",
+                &[],
+            )
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        assert!(arr[0].get("h").unwrap().is_string());
+    }
+
+    #[test]
+    fn query_to_json_ubigint_overflow() {
+        let server = setup_server();
+        // Value exceeding i64 max → returned as string
+        let result = server
+            .query_to_json("SELECT 18446744073709551615::UBIGINT AS ub", &[])
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        let val = arr[0].get("ub").unwrap();
+        assert!(val.is_string());
+        assert_eq!(val.as_str().unwrap(), "18446744073709551615");
+    }
+
+    #[test]
+    fn query_to_json_nan_float() {
+        let server = setup_server();
+        // NaN cannot be represented in JSON, falls back to string
+        let result = server
+            .query_to_json("SELECT 'NaN'::FLOAT AS f, 'NaN'::DOUBLE AS d", &[])
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        let obj = arr[0].as_object().unwrap();
+        assert!(obj["f"].is_string());
+        assert!(obj["d"].is_string());
+    }
+
+    #[test]
+    fn query_to_json_date_type() {
+        let server = setup_server();
+        // DATE type goes through the catch-all branch
+        let result = server
+            .query_to_json("SELECT DATE '2024-01-15' AS d", &[])
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_run_server_invalid_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        // Create a real DB file
+        {
+            let conn = crate::db::open_db(&db_path).unwrap();
+            ensure_schema(&conn).unwrap();
+        }
+
+        let result = run_server(&db_path, "127.0.0.1", 0, "invalid").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown transport"));
+    }
+
+    #[test]
+    fn debug_impl() {
+        let server = setup_server();
+        let debug = format!("{:?}", server);
+        assert!(debug.contains("HealthServer"));
+        assert!(debug.contains(":memory:"));
+    }
+
+    #[tokio::test]
+    async fn tool_list_workouts_with_filters() {
+        let server = setup_server();
+        let params = Parameters(ListWorkoutsParams {
+            activity_type: Some("HKWorkoutActivityTypeRunning".to_string()),
+            start_date: Some("2024-01-01".to_string()),
+            end_date: Some("2024-12-31".to_string()),
+            limit: Some(10),
+        });
+        let result = server.list_workouts(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_get_activity_summaries_with_dates() {
+        let server = setup_server();
+        let params = Parameters(GetActivitySummariesParams {
+            start_date: Some("2024-01-01".to_string()),
+            end_date: Some("2024-12-31".to_string()),
+            limit: Some(10),
+        });
+        let result = server.get_activity_summaries(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_list_ecg_readings_with_dates() {
+        let server = setup_server();
+        let params = Parameters(ListEcgReadingsParams {
+            start_date: Some("2024-01-01".to_string()),
+            end_date: Some("2024-12-31".to_string()),
+        });
+        let result = server.list_ecg_readings(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_get_record_statistics_periods() {
+        let server = setup_server();
+        for period in &["day", "week", "month", "year"] {
+            let params = Parameters(GetRecordStatisticsParams {
+                record_type: "HKQuantityTypeIdentifierHeartRate".to_string(),
+                start_date: None,
+                end_date: None,
+                period: Some(period.to_string()),
+            });
+            let result = server.get_record_statistics(params).await;
+            let parsed: Value = serde_json::from_str(&result).unwrap();
+            assert!(!parsed.as_array().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_get_workout_details_nonexistent() {
+        let server = setup_server();
+        let params = Parameters(GetWorkoutDetailsParams {
+            workout_hash: "nonexistent".to_string(),
+        });
+        let result = server.get_workout_details(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("workout").unwrap().is_null());
+        assert_eq!(parsed.get("has_route").unwrap(), &Value::Bool(false));
+    }
 }
