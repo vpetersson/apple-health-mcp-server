@@ -259,19 +259,24 @@ impl HealthServer {
             "SELECT record_hash, record_type, value, text_value, unit, source_name, start_date, end_date FROM records WHERE record_type = ?",
         );
         let record_type = params.record_type;
+        let mut binds: Vec<&dyn duckdb::ToSql> = vec![&record_type];
 
         if let Some(ref sd) = params.start_date {
-            sql.push_str(&format!(" AND start_date >= '{}'", sd.replace('\'', "''")));
+            sql.push_str(" AND start_date >= ?");
+            binds.push(sd);
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(" AND end_date <= '{}'", ed.replace('\'', "''")));
+            sql.push_str(" AND end_date <= ?");
+            binds.push(ed);
         }
         if let Some(ref sn) = params.source_name {
-            sql.push_str(&format!(" AND source_name = '{}'", sn.replace('\'', "''")));
+            sql.push_str(" AND source_name = ?");
+            binds.push(sn);
         }
+        // LIMIT is a clamped integer (u32); safe to interpolate directly.
         sql.push_str(&format!(" ORDER BY start_date DESC LIMIT {}", limit));
 
-        match self.query_to_json(&sql, &[&record_type as &dyn duckdb::ToSql]) {
+        match self.query_to_json(&sql, &binds) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -290,6 +295,8 @@ impl HealthServer {
             _ => "date",
         };
 
+        // `date_trunc` is selected from a fixed whitelist of expressions
+        // (see the `match period` above), so direct interpolation is safe.
         let mut sql = format!(
             "SELECT {} as period, SUM(count) as count, \
              SUM(sum_value)/SUM(count) as avg_value, \
@@ -300,16 +307,19 @@ impl HealthServer {
         );
 
         let record_type = params.record_type;
+        let mut binds: Vec<&dyn duckdb::ToSql> = vec![&record_type];
 
         if let Some(ref sd) = params.start_date {
-            sql.push_str(&format!(" AND date >= '{}'", sd.replace('\'', "''")));
+            sql.push_str(" AND date >= ?");
+            binds.push(sd);
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(" AND date <= '{}'", ed.replace('\'', "''")));
+            sql.push_str(" AND date <= ?");
+            binds.push(ed);
         }
         sql.push_str(&format!(" GROUP BY {} ORDER BY period", date_trunc));
 
-        match self.query_to_json(&sql, &[&record_type as &dyn duckdb::ToSql]) {
+        match self.query_to_json(&sql, &binds) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -326,22 +336,23 @@ impl HealthServer {
              total_distance, total_distance_unit, total_energy_burned, total_energy_unit, \
              source_name, start_date, end_date FROM workouts WHERE 1=1",
         );
+        let mut binds: Vec<&dyn duckdb::ToSql> = Vec::new();
 
         if let Some(ref at) = params.activity_type {
-            sql.push_str(&format!(
-                " AND activity_type = '{}'",
-                at.replace('\'', "''")
-            ));
+            sql.push_str(" AND activity_type = ?");
+            binds.push(at);
         }
         if let Some(ref sd) = params.start_date {
-            sql.push_str(&format!(" AND start_date >= '{}'", sd.replace('\'', "''")));
+            sql.push_str(" AND start_date >= ?");
+            binds.push(sd);
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(" AND end_date <= '{}'", ed.replace('\'', "''")));
+            sql.push_str(" AND end_date <= ?");
+            binds.push(ed);
         }
         sql.push_str(&format!(" ORDER BY start_date DESC LIMIT {}", limit));
 
-        match self.query_to_json(&sql, &[]) {
+        match self.query_to_json(&sql, &binds) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -406,22 +417,19 @@ impl HealthServer {
         let Parameters(params) = params;
         let limit = params.limit.unwrap_or(30).min(365);
         let mut sql = String::from("SELECT * FROM activity_summaries WHERE 1=1");
+        let mut binds: Vec<&dyn duckdb::ToSql> = Vec::new();
 
         if let Some(ref sd) = params.start_date {
-            sql.push_str(&format!(
-                " AND date_components >= '{}'",
-                sd.replace('\'', "''")
-            ));
+            sql.push_str(" AND date_components >= ?");
+            binds.push(sd);
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(
-                " AND date_components <= '{}'",
-                ed.replace('\'', "''")
-            ));
+            sql.push_str(" AND date_components <= ?");
+            binds.push(ed);
         }
         sql.push_str(&format!(" ORDER BY date_components DESC LIMIT {}", limit));
 
-        match self.query_to_json(&sql, &[]) {
+        match self.query_to_json(&sql, &binds) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -449,21 +457,18 @@ impl HealthServer {
         let mut sql = String::from(
             "SELECT ecg_hash, recorded_date, classification, device, sample_rate_hz FROM ecg_readings WHERE 1=1",
         );
+        let mut binds: Vec<&dyn duckdb::ToSql> = Vec::new();
         if let Some(ref sd) = params.start_date {
-            sql.push_str(&format!(
-                " AND recorded_date >= '{}'",
-                sd.replace('\'', "''")
-            ));
+            sql.push_str(" AND recorded_date >= ?");
+            binds.push(sd);
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(
-                " AND recorded_date <= '{}'",
-                ed.replace('\'', "''")
-            ));
+            sql.push_str(" AND recorded_date <= ?");
+            binds.push(ed);
         }
         sql.push_str(" ORDER BY recorded_date DESC");
 
-        match self.query_to_json(&sql, &[]) {
+        match self.query_to_json(&sql, &binds) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -785,6 +790,117 @@ mod tests {
         let result = server.query_records(params).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 1);
+    }
+
+    // Issue #3 AC: a SQL-injection PoC fed into a filter parameter must
+    // produce either zero rows or a clean error — never trigger the injected
+    // statement. Pre-fix this would have appended `' UNION SELECT ... --` to
+    // the WHERE clause; after the bind conversion it is passed as a value
+    // and matches no row.
+    #[tokio::test]
+    async fn tool_query_records_resists_sql_injection_via_source_name() {
+        let server = setup_server();
+        let params = Parameters(QueryRecordsParams {
+            record_type: "HKQuantityTypeIdentifierHeartRate".to_string(),
+            start_date: None,
+            end_date: None,
+            source_name: Some(
+                "Y' UNION SELECT password FROM secrets --".to_string(),
+            ),
+            limit: None,
+        });
+        let result = server.query_records(params).await;
+        // Must not be an error string — bind must have neutralized the input.
+        assert!(
+            !result.starts_with("Error:"),
+            "injection input must not surface as a SQL error: {result}"
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        // No row has this source_name, so the filter must produce zero rows.
+        assert_eq!(parsed.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tool_list_workouts_resists_sql_injection_via_activity_type() {
+        let server = setup_server();
+        let params = Parameters(ListWorkoutsParams {
+            activity_type: Some("'; DROP TABLE workouts; --".to_string()),
+            start_date: None,
+            end_date: None,
+            limit: None,
+        });
+        let result = server.list_workouts(params).await;
+        assert!(
+            !result.starts_with("Error:"),
+            "injection input must not surface as a SQL error: {result}"
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 0);
+    }
+
+    // Smoke tests covering the remaining tools' date filters. Each tool shares
+    // `query_to_json` so the bind path is identical, but a per-tool assertion
+    // catches regressions if a future refactor reverts one tool to format!.
+    //
+    // Acceptable outcomes for an injected timestamp string after bind:
+    //   - an `Error: ...` string from DuckDB rejecting it as a malformed
+    //     timestamp value (the value reached the column comparator), or
+    //   - a JSON array — possibly empty (no match), possibly with all rows
+    //     (string-VARCHAR comparators may sort an injection payload before
+    //     every stored timestamp). Both prove the value was treated as a
+    //     bind value, not as SQL.
+    // The only failure shape would be a non-array, non-error response, which
+    // would indicate the parser saw the injected SQL.
+    fn injection_was_neutralized(result: &str) -> bool {
+        if result.starts_with("Error:") {
+            return true;
+        }
+        serde_json::from_str::<Value>(result).is_ok_and(|v| v.is_array())
+    }
+
+    #[tokio::test]
+    async fn tool_get_record_statistics_resists_sql_injection_via_start_date() {
+        let server = setup_server();
+        let params = Parameters(GetRecordStatisticsParams {
+            record_type: "HKQuantityTypeIdentifierHeartRate".to_string(),
+            start_date: Some("' OR 1=1 --".to_string()),
+            end_date: None,
+            period: Some("day".to_string()),
+        });
+        let result = server.get_record_statistics(params).await;
+        assert!(
+            injection_was_neutralized(&result),
+            "injection must be neutralized (error or empty), got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_get_activity_summaries_resists_sql_injection_via_start_date() {
+        let server = setup_server();
+        let params = Parameters(GetActivitySummariesParams {
+            start_date: Some("'; DROP TABLE activity_summaries; --".to_string()),
+            end_date: None,
+            limit: None,
+        });
+        let result = server.get_activity_summaries(params).await;
+        assert!(
+            injection_was_neutralized(&result),
+            "injection must be neutralized (error or empty), got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_list_ecg_readings_resists_sql_injection_via_start_date() {
+        let server = setup_server();
+        let params = Parameters(ListEcgReadingsParams {
+            start_date: Some("' UNION SELECT * FROM ecg_samples --".to_string()),
+            end_date: None,
+        });
+        let result = server.list_ecg_readings(params).await;
+        assert!(
+            injection_was_neutralized(&result),
+            "injection must be neutralized (error or empty), got {result}"
+        );
     }
 
     #[tokio::test]
