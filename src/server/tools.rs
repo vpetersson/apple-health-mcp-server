@@ -77,6 +77,19 @@ pub struct ListEcgReadingsParams {
 pub struct GetEcgDataParams {
     #[schemars(description = "The ECG hash identifier")]
     pub ecg_hash: String,
+    #[schemars(
+        description = "If true, also return the voltage_uv samples array \
+                       (potentially tens of thousands of values — use sparingly \
+                       through an LLM, or pair with downsample_factor). \
+                       Defaults to false: only metadata + summary stats are returned."
+    )]
+    pub include_voltages: Option<bool>,
+    #[schemars(
+        description = "Keep every Nth voltage sample when include_voltages=true. \
+                       e.g. 10 returns ~1.5k samples from a 30s/512Hz recording. \
+                       Defaults to 1 (no downsampling). Clamped to >= 1."
+    )]
+    pub downsample_factor: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

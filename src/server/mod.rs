@@ -497,11 +497,14 @@ impl HealthServer {
     }
 
     #[tool(
-        description = "Get full ECG waveform by ecg_hash. Returns: reading (metadata), sample_count, voltages_uv (array of voltage values in microvolts). Get ecg_hash from list_ecg_readings."
+        description = "Get ECG data by ecg_hash. Returns: reading (metadata), stats (sample_count, mean_uv, min_uv, max_uv, stddev_uv — STDDEV_SAMP), downsample_factor, and voltages_uv (empty by default). Set include_voltages=true to get the waveform array; pair with downsample_factor (e.g. 10) to thin it out so the LLM context doesn't get overwhelmed. Downsampling is naive every-Nth-sample decimation (no anti-alias filter) — fine for waveform visualization, avoid for spectral analysis. NOTE: in earlier versions sample_count was a top-level field; it is now under stats. Get ecg_hash from list_ecg_readings."
     )]
     async fn get_ecg_data(&self, params: Parameters<GetEcgDataParams>) -> String {
         let Parameters(params) = params;
         let hash = params.ecg_hash;
+        let include_voltages = params.include_voltages.unwrap_or(false);
+        let downsample = params.downsample_factor.unwrap_or(1).max(1);
+
         let metadata = match self.query_to_json(
             "SELECT * FROM ecg_readings WHERE ecg_hash = ?",
             &[&hash as &dyn duckdb::ToSql],
@@ -510,26 +513,60 @@ impl HealthServer {
             Err(e) => return format!("Error: {}", e),
         };
 
-        let samples = match self.query_to_json(
-            "SELECT voltage_uv FROM ecg_samples WHERE ecg_hash = ? ORDER BY sample_idx",
+        // Summary stats are always returned — cheap to compute, keep callers
+        // from having to issue a follow-up query just to know how big the
+        // recording is or whether the voltage range is sane.
+        //
+        // COALESCE wraps the aggregates because query_to_json drops NULL
+        // columns from the JSON object, and AVG/MIN/MAX/STDDEV_SAMP are NULL
+        // for empty or single-sample sets. Without COALESCE, callers would
+        // see the key disappear entirely on edge-case recordings.
+        //
+        // STDDEV_SAMP is spelled explicitly (the bare STDDEV alias also
+        // means sample stddev in DuckDB) so the intent is obvious to readers.
+        let stats = match self.query_to_json(
+            "SELECT COUNT(*) AS sample_count, \
+             COALESCE(AVG(voltage_uv), 0.0) AS mean_uv, \
+             COALESCE(MIN(voltage_uv), 0.0) AS min_uv, \
+             COALESCE(MAX(voltage_uv), 0.0) AS max_uv, \
+             COALESCE(STDDEV_SAMP(voltage_uv), 0.0) AS stddev_uv \
+             FROM ecg_samples WHERE ecg_hash = ?",
             &[&hash as &dyn duckdb::ToSql],
         ) {
             Ok(r) => r,
             Err(e) => return format!("Error: {}", e),
         };
-
-        let voltages: Vec<Value> = samples
+        let stats_obj = stats
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|r| r.get("voltage_uv").cloned())
-                    .collect()
-            })
-            .unwrap_or_default();
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let voltages: Vec<Value> = if include_voltages {
+            let samples = match self.query_to_json(
+                "SELECT voltage_uv FROM ecg_samples WHERE ecg_hash = ? ORDER BY sample_idx",
+                &[&hash as &dyn duckdb::ToSql],
+            ) {
+                Ok(r) => r,
+                Err(e) => return format!("Error: {}", e),
+            };
+            samples
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .step_by(downsample)
+                        .filter_map(|r| r.get("voltage_uv").cloned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let result = json!({
             "reading": metadata.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
-            "sample_count": voltages.len(),
+            "stats": stats_obj,
+            "downsample_factor": downsample,
             "voltages_uv": voltages,
         });
 
@@ -1005,14 +1042,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_get_ecg_data() {
+    async fn tool_get_ecg_data_default_returns_stats_only() {
+        // Default (no include_voltages) returns stats but no voltage array,
+        // keeping the response small for the LLM context.
+        // setup_server inserts voltages 100, 200, 300 into ecg_samples.
         let server = setup_server();
         let params = Parameters(GetEcgDataParams {
             ecg_hash: "ecg1".to_string(),
+            include_voltages: None,
+            downsample_factor: None,
         });
         let result = server.get_ecg_data(params).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.get("sample_count").unwrap(), 3);
+        assert_eq!(
+            parsed.get("voltages_uv").unwrap().as_array().unwrap().len(),
+            0,
+            "voltages must be empty by default"
+        );
+        let stats = parsed.get("stats").unwrap();
+        assert_eq!(stats.get("sample_count").unwrap(), 3);
+
+        // Spot-check the aggregate values so a SUM-vs-AVG mix-up or
+        // STDDEV_POP-vs-STDDEV_SAMP swap is caught in CI. The fixture is
+        // voltages 100, 200, -50 -> mean 250/3 ≈ 83.33, min -50, max 200,
+        // STDDEV_SAMP ≈ 125.83 (variance = 15833.33, /N-1=2).
+        let mean = stats.get("mean_uv").and_then(Value::as_f64).unwrap();
+        let min = stats.get("min_uv").and_then(Value::as_f64).unwrap();
+        let max = stats.get("max_uv").and_then(Value::as_f64).unwrap();
+        let stddev = stats.get("stddev_uv").and_then(Value::as_f64).unwrap();
+        assert!((mean - 83.333).abs() < 0.01, "mean_uv was {mean}");
+        assert!((min - -50.0).abs() < 0.01, "min_uv was {min}");
+        assert!((max - 200.0).abs() < 0.01, "max_uv was {max}");
+        assert!(
+            (stddev - 125.831).abs() < 0.5,
+            "stddev_uv was {stddev} (expected ~125.83 = STDDEV_SAMP of 100,200,-50)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_get_ecg_data_include_voltages() {
+        let server = setup_server();
+        let params = Parameters(GetEcgDataParams {
+            ecg_hash: "ecg1".to_string(),
+            include_voltages: Some(true),
+            downsample_factor: None,
+        });
+        let result = server.get_ecg_data(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("voltages_uv").unwrap().as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(parsed.get("downsample_factor").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_get_ecg_data_downsamples() {
+        let server = setup_server();
+        let params = Parameters(GetEcgDataParams {
+            ecg_hash: "ecg1".to_string(),
+            include_voltages: Some(true),
+            downsample_factor: Some(2),
+        });
+        let result = server.get_ecg_data(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        // 3 samples / step_by(2) -> samples at idx 0 and 2 = 2 entries.
+        assert_eq!(
+            parsed.get("voltages_uv").unwrap().as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(parsed.get("downsample_factor").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_get_ecg_data_zero_downsample_clamped() {
+        // downsample_factor=0 would panic in `step_by`; the helper must
+        // clamp to >= 1.
+        let server = setup_server();
+        let params = Parameters(GetEcgDataParams {
+            ecg_hash: "ecg1".to_string(),
+            include_voltages: Some(true),
+            downsample_factor: Some(0),
+        });
+        let result = server.get_ecg_data(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("downsample_factor").unwrap(), 1);
         assert_eq!(
             parsed.get("voltages_uv").unwrap().as_array().unwrap().len(),
             3
