@@ -5,6 +5,7 @@ use duckdb::types::ValueRef;
 use duckdb::Connection;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
@@ -430,7 +431,18 @@ impl HealthServer {
 }
 
 #[tool_handler]
-impl ServerHandler for HealthServer {}
+impl ServerHandler for HealthServer {
+    // Override the default `get_info` to declare the `tools` capability.
+    // Without this, `ServerInfo::default()` returns empty `ServerCapabilities`
+    // and spec-compliant MCP clients (e.g. Claude Code) will not issue
+    // `tools/list`, leaving every `#[tool]` method invisible to the client.
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            ..Default::default()
+        }
+    }
+}
 
 pub async fn run_server(db_path: &Path, host: &str, port: u16, transport: &str) -> Result<()> {
     match transport {
