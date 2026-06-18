@@ -130,13 +130,13 @@ impl HealthServer {
     }
 
     #[tool(
-        description = "Query individual health records. Returns: record_hash, record_type, value (numeric measurement), unit, source_name, start_date, end_date. Record types use Apple's HK identifiers (e.g. HKQuantityTypeIdentifierHeartRate). Use list_record_types first to discover available types."
+        description = "Query individual health records. Returns: record_hash, record_type, value (numeric measurement), text_value (categorical value, e.g. sleep stages like HKCategoryValueSleepAnalysisAsleepDeep), unit, source_name, start_date, end_date. Record types use Apple's HK identifiers (e.g. HKQuantityTypeIdentifierHeartRate, HKCategoryTypeIdentifierSleepAnalysis). Use list_record_types first to discover available types."
     )]
     async fn query_records(&self, params: Parameters<QueryRecordsParams>) -> String {
         let Parameters(params) = params;
         let limit = params.limit.unwrap_or(100).min(1000);
         let mut sql = String::from(
-            "SELECT record_hash, record_type, value, unit, source_name, start_date, end_date FROM records WHERE record_type = ?",
+            "SELECT record_hash, record_type, value, text_value, unit, source_name, start_date, end_date FROM records WHERE record_type = ?",
         );
         let record_type = params.record_type;
 
@@ -490,9 +490,9 @@ mod tests {
         // Seed data
         conn.execute_batch(
             "
-            INSERT INTO records VALUES ('rh1', 'HKQuantityTypeIdentifierHeartRate', 72.0, 'count/min', 'Apple Watch', '10.0', NULL, '2024-01-01 08:00:00', '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
-            INSERT INTO records VALUES ('rh2', 'HKQuantityTypeIdentifierHeartRate', 80.0, 'count/min', 'Apple Watch', '10.0', NULL, '2024-01-01 09:00:00', '2024-01-01 09:00:00', '2024-01-01 09:01:00', 'imp1');
-            INSERT INTO records VALUES ('rh3', 'HKQuantityTypeIdentifierStepCount', 1500.0, 'count', 'iPhone', '17.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 23:59:59', 'imp1');
+            INSERT INTO records VALUES ('rh1', 'HKQuantityTypeIdentifierHeartRate', 72.0, NULL, 'count/min', 'Apple Watch', '10.0', NULL, '2024-01-01 08:00:00', '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
+            INSERT INTO records VALUES ('rh2', 'HKQuantityTypeIdentifierHeartRate', 80.0, NULL, 'count/min', 'Apple Watch', '10.0', NULL, '2024-01-01 09:00:00', '2024-01-01 09:00:00', '2024-01-01 09:01:00', 'imp1');
+            INSERT INTO records VALUES ('rh3', 'HKQuantityTypeIdentifierStepCount', 1500.0, NULL, 'count', 'iPhone', '17.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 23:59:59', 'imp1');
             INSERT INTO record_metadata VALUES ('rh1', 'HKMetadataKeyHeartRateMotionContext', '1');
             INSERT INTO workouts VALUES ('wh1', 'HKWorkoutActivityTypeRunning', 1800.0, 'sec', 5000.0, 'm', 300.0, 'kcal', 'Apple Watch', '10.0', NULL, '2024-01-01 10:00:00', '2024-01-01 10:00:00', '2024-01-01 10:30:00', 'imp1');
             INSERT INTO workout_events VALUES ('wh1', 'HKWorkoutEventTypeLap', '2024-01-01 10:15:00', NULL, NULL);
@@ -796,7 +796,7 @@ mod tests {
     async fn tool_run_custom_query_rejects_insert() {
         let server = setup_server();
         let params = Parameters(RunCustomQueryParams {
-            query: "INSERT INTO records VALUES ('a','b',1,'c','d',NULL,NULL,NULL,'2024-01-01','2024-01-01','x')".to_string(),
+            query: "INSERT INTO records VALUES ('a','b',1,NULL,'c','d',NULL,NULL,NULL,'2024-01-01','2024-01-01','x')".to_string(),
         });
         let result = server.run_custom_query(params).await;
         assert!(result.starts_with("Error: Query must start with SELECT or WITH"));
