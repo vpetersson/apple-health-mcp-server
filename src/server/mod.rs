@@ -9,10 +9,130 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde_json::{json, Value};
+use sqlparser::ast::{Expr, ObjectName, Statement, TableFactor, Visit, Visitor};
+use sqlparser::dialect::DuckDbDialect;
+use sqlparser::parser::Parser;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tools::*;
+
+/// Built-in DuckDB functions that can read host files or hit external networks.
+/// `run_custom_query` is exposed to LLM-generated SQL, so even a read-only
+/// connection must reject these because the data leaves through the query
+/// result. See issues #1 and #2.
+const DENIED_FUNCTIONS: &[&str] = &[
+    "read_text",
+    "read_text_auto",
+    "read_blob",
+    "read_blob_auto",
+    "read_csv",
+    "read_csv_auto",
+    "read_parquet",
+    "read_json",
+    "read_json_auto",
+    "read_ndjson",
+    "read_ndjson_auto",
+    "glob",
+];
+
+/// AST visitor that fails as soon as a denylisted function call is seen.
+/// Covers scalar calls (`Expr::Function`), table-valued calls via the
+/// `relation` hook (`TableFactor::Table::name` has `#[visit(with = ...)]`),
+/// and `TableFactor::Function { name }` (the `LATERAL <fn>(...)` form) which
+/// the relation hook does NOT visit.
+struct DeniedFunctionVisitor {
+    denied: Option<String>,
+}
+
+impl DeniedFunctionVisitor {
+    fn check_name(&mut self, name: &ObjectName) -> ControlFlow<()> {
+        if let Some(last) = name.0.last() {
+            let Some(ident) = last.as_ident() else {
+                return ControlFlow::Continue(());
+            };
+            if DENIED_FUNCTIONS
+                .iter()
+                .any(|f| ident.value.eq_ignore_ascii_case(f))
+            {
+                self.denied = Some(ident.value.clone());
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl Visitor for DeniedFunctionVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Function(func) = expr {
+            self.check_name(&func.name)?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        // `FROM read_text('/etc/passwd')` reaches us here.
+        self.check_name(relation)
+    }
+
+    fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<Self::Break> {
+        // `FROM LATERAL read_text('/etc/passwd')` parses as TableFactor::Function
+        // whose `name` field has no #[visit(with = visit_relation)] annotation,
+        // so it is NOT reached by pre_visit_relation. Match it explicitly here.
+        // The `Table` arm is intentionally redundant with pre_visit_relation —
+        // belt-and-suspenders against AST refactors.
+        match tf {
+            TableFactor::Table { name, .. } => self.check_name(name)?,
+            TableFactor::Function { name, .. } => self.check_name(name)?,
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Parse `sql` with the DuckDB dialect and reject anything that is not a
+/// single read-only SELECT / WITH query free of dangerous built-ins. Returns
+/// the human-readable error message that should be sent back to the MCP
+/// client when validation fails.
+pub(crate) fn validate_query(sql: &str) -> Result<(), String> {
+    let statements = Parser::parse_sql(&DuckDbDialect {}, sql)
+        .map_err(|e| format!("SQL parse error: {e}"))?;
+
+    if statements.is_empty() {
+        return Err("Query is empty".to_string());
+    }
+    if statements.len() > 1 {
+        return Err(format!(
+            "Only a single SQL statement is allowed (got {})",
+            statements.len()
+        ));
+    }
+
+    let stmt = &statements[0];
+    if !matches!(stmt, Statement::Query(_)) {
+        return Err(
+            "Only SELECT / WITH queries are allowed (DDL, DML, ATTACH, COPY, \
+             INSTALL, LOAD, PRAGMA, etc. are rejected)"
+                .to_string(),
+        );
+    }
+
+    let mut visitor = DeniedFunctionVisitor { denied: None };
+    if let ControlFlow::Break(()) = stmt.visit(&mut visitor) {
+        // Break() implies the visitor set `denied`.
+        if let Some(name) = visitor.denied {
+            return Err(format!(
+                "Function '{name}' is not allowed (reads host files or external resources)"
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct HealthServer {
@@ -395,9 +515,9 @@ impl HealthServer {
     async fn run_custom_query(&self, params: Parameters<RunCustomQueryParams>) -> String {
         let Parameters(params) = params;
         let trimmed = params.query.trim().to_string();
-        let upper = trimmed.to_uppercase();
-        if !upper.starts_with("SELECT") && !upper.starts_with("WITH") {
-            return "Error: Query must start with SELECT or WITH".to_string();
+
+        if let Err(msg) = validate_query(&trimmed) {
+            return format!("Error: {msg}");
         }
 
         match self.query_to_json(&trimmed, &[]) {
@@ -789,17 +909,154 @@ mod tests {
             query: "DROP TABLE records".to_string(),
         });
         let result = server.run_custom_query(params).await;
-        assert!(result.starts_with("Error: Query must start with SELECT or WITH"));
+        assert!(result.starts_with("Error:"), "got {result}");
     }
 
     #[tokio::test]
     async fn tool_run_custom_query_rejects_insert() {
         let server = setup_server();
         let params = Parameters(RunCustomQueryParams {
-            query: "INSERT INTO records VALUES ('a','b',1,NULL,'c','d',NULL,NULL,NULL,'2024-01-01','2024-01-01','x')".to_string(),
+            query: "INSERT INTO records VALUES ('a','b',1,NULL,'c','d',NULL,NULL,NULL,'2024-01-01','2024-01-01','x',NULL)".to_string(),
         });
         let result = server.run_custom_query(params).await;
-        assert!(result.starts_with("Error: Query must start with SELECT or WITH"));
+        assert!(result.starts_with("Error:"), "got {result}");
+    }
+
+    // Issue #2 bypass PoCs from the issue body — every one of these must be
+    // rejected by `validate_query`. Also covers issue #1's filesystem-function
+    // attack surface, which #2 absorbed.
+    #[test]
+    fn validate_rejects_multiple_statements() {
+        let r = validate_query("SELECT 1; ATTACH 'http://example/x.duckdb' AS x");
+        assert!(r.is_err(), "multi-statement must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_with_then_drop() {
+        let r = validate_query("WITH _ AS (SELECT 1) DROP TABLE records");
+        assert!(r.is_err(), "non-Query statement must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_comment_then_mutation() {
+        let r = validate_query("SELECT/*comment*/ * FROM records; DELETE FROM records");
+        assert!(r.is_err(), "multi-statement after comment must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_filesystem_functions() {
+        for fname in [
+            "read_text",
+            "read_blob",
+            "read_csv",
+            "read_csv_auto",
+            "read_parquet",
+            "read_json",
+            "read_json_auto",
+            "glob",
+        ] {
+            let sql = format!("SELECT * FROM {fname}('/etc/passwd')");
+            let r = validate_query(&sql);
+            assert!(r.is_err(), "{fname} must be rejected, got {r:?} for {sql}");
+            let msg = r.unwrap_err();
+            assert!(
+                msg.to_ascii_lowercase().contains(fname),
+                "error must mention the denied function name: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_filesystem_function_auto_variants() {
+        // `read_text_auto` and `read_blob_auto` are denied as a precaution
+        // even though they are not always present in every DuckDB version.
+        for fname in ["read_text_auto", "read_blob_auto"] {
+            let sql = format!("SELECT * FROM {fname}('/etc/passwd')");
+            let r = validate_query(&sql);
+            assert!(r.is_err(), "{fname} must be rejected: {r:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_filesystem_function_uppercase() {
+        // Casing must not matter — `READ_TEXT` should also be denied.
+        let r = validate_query("SELECT READ_TEXT('/etc/passwd')");
+        assert!(r.is_err(), "uppercase variant must also be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_lateral_table_function() {
+        // Regression test for the LATERAL bypass discovered during review.
+        // sqlparser parses this as TableFactor::Function whose `name` is NOT
+        // visited via the `relation` hook; only `pre_visit_table_factor`
+        // catches it.
+        let r = validate_query("SELECT * FROM LATERAL read_text('/etc/passwd')");
+        assert!(r.is_err(), "LATERAL table function must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_schema_qualified_function() {
+        // `name.0.last()` must take the last segment so a schema-qualified
+        // call like `main.read_text(...)` is still recognized.
+        let r = validate_query("SELECT * FROM main.read_text('/etc/passwd')");
+        assert!(r.is_err(), "schema-qualified denied function must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_attach_statement() {
+        let r = validate_query("ATTACH 'http://example/x.duckdb' AS x");
+        assert!(r.is_err(), "ATTACH must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_copy_statement() {
+        let r = validate_query("COPY records TO '/tmp/out.csv'");
+        assert!(r.is_err(), "COPY must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_install_statement() {
+        let r = validate_query("INSTALL httpfs");
+        assert!(r.is_err(), "INSTALL must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_load_statement() {
+        let r = validate_query("LOAD httpfs");
+        assert!(r.is_err(), "LOAD must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_pragma_statement() {
+        let r = validate_query("PRAGMA database_list");
+        assert!(r.is_err(), "PRAGMA must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_accepts_plain_select() {
+        assert!(validate_query("SELECT 1").is_ok());
+        assert!(validate_query("SELECT * FROM records WHERE value > 0 LIMIT 10").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_with_query() {
+        assert!(validate_query("WITH t AS (SELECT 1 AS n) SELECT n FROM t").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_garbage_input() {
+        let r = validate_query("not even sql");
+        assert!(r.is_err(), "garbage must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_input() {
+        // Empty input / bare `;` should produce a clear message, not
+        // "got 0 statements".
+        for sql in ["", "   ", ";", "  ;  "] {
+            let r = validate_query(sql);
+            assert!(r.is_err(), "empty input {sql:?} must be rejected: {r:?}");
+        }
     }
 
     #[tokio::test]
