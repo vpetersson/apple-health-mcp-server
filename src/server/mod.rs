@@ -94,6 +94,28 @@ impl Visitor for DeniedFunctionVisitor {
     }
 }
 
+/// Maximum row cap that `run_custom_query` will enforce when the caller
+/// did not specify a LIMIT of their own. Protects the LLM context window
+/// from a `SELECT * FROM records` that would otherwise return millions
+/// of rows.
+pub(crate) const MAX_CUSTOM_QUERY_ROWS: usize = 1000;
+
+/// If the outer query already has a LIMIT clause, return `sql` unchanged.
+/// Otherwise append `LIMIT <max_rows>` so unbounded SELECTs cannot blow up
+/// the LLM context. `validate_query` must have already confirmed `sql` is
+/// a single SELECT/WITH so the append is unambiguous.
+pub(crate) fn enforce_limit(sql: &str, max_rows: usize) -> String {
+    if let Ok(stmts) = Parser::parse_sql(&DuckDbDialect {}, sql) {
+        if let Some(Statement::Query(query)) = stmts.first() {
+            if query.limit_clause.is_some() {
+                return sql.to_string();
+            }
+        }
+    }
+    let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
+    format!("{trimmed} LIMIT {max_rows}")
+}
+
 /// Parse `sql` with the DuckDB dialect and reject anything that is not a
 /// single read-only SELECT / WITH query free of dangerous built-ins. Returns
 /// the human-readable error message that should be sent back to the MCP
@@ -525,7 +547,8 @@ impl HealthServer {
             return format!("Error: {msg}");
         }
 
-        match self.query_to_json(&trimmed, &[]) {
+        let sql = enforce_limit(&trimmed, MAX_CUSTOM_QUERY_ROWS);
+        match self.query_to_json(&sql, &[]) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -1173,6 +1196,63 @@ mod tests {
             let r = validate_query(sql);
             assert!(r.is_err(), "empty input {sql:?} must be rejected: {r:?}");
         }
+    }
+
+    // Issue #11: enforce_limit must append LIMIT to LIMIT-less queries and
+    // leave queries that already specify a LIMIT alone.
+    #[test]
+    fn enforce_limit_appends_when_absent() {
+        assert_eq!(
+            enforce_limit("SELECT * FROM records", 100),
+            "SELECT * FROM records LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn enforce_limit_strips_trailing_semicolon_before_appending() {
+        assert_eq!(
+            enforce_limit("SELECT * FROM records;", 50),
+            "SELECT * FROM records LIMIT 50"
+        );
+        assert_eq!(
+            enforce_limit("SELECT * FROM records ;  ", 50),
+            "SELECT * FROM records LIMIT 50"
+        );
+    }
+
+    #[test]
+    fn enforce_limit_leaves_existing_limit_alone() {
+        let sql = "SELECT * FROM records LIMIT 5";
+        assert_eq!(enforce_limit(sql, 100), sql);
+    }
+
+    #[test]
+    fn enforce_limit_recognizes_lowercase_limit() {
+        let sql = "select * from records limit 5";
+        // AST-based check is case-insensitive.
+        assert_eq!(enforce_limit(sql, 100), sql);
+    }
+
+    #[test]
+    fn enforce_limit_ignores_inner_limit_in_subquery() {
+        // A LIMIT inside a CTE / subquery does NOT count as the outer
+        // query's LIMIT; the outer query is still unbounded and must be
+        // capped.
+        let sql = "WITH t AS (SELECT * FROM records LIMIT 5) SELECT * FROM t";
+        let result = enforce_limit(sql, 100);
+        assert!(
+            result.ends_with("LIMIT 100"),
+            "outer query lacks LIMIT, must be appended: {result}"
+        );
+    }
+
+    #[test]
+    fn enforce_limit_falls_back_to_append_on_parse_failure() {
+        // If sqlparser somehow can't parse the input, we still want to
+        // cap the result rather than let an unbounded query through.
+        // validate_query gates this in practice, but defense in depth.
+        let result = enforce_limit("not real sql", 50);
+        assert!(result.ends_with("LIMIT 50"), "fallback append: {result}");
     }
 
     #[tokio::test]
