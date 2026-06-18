@@ -114,6 +114,9 @@ pub fn import_ecg_files(conn: &Connection, ecg_dir: &Path, import_id: &str) -> R
 }
 
 pub(crate) fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str) -> Result<()> {
+    // Read the file once and reuse the buffer for both the header pass and
+    // the voltage pass. The previous implementation called read_to_string
+    // twice, doubling I/O for every ECG file.
     let content = fs::read_to_string(path).context("Failed to read ECG file")?;
     let content = strip_bom(&content);
     let mut lines = content.lines();
@@ -126,22 +129,27 @@ pub(crate) fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str)
     let mut symptoms = None;
     let mut software_version = None;
 
+    // Remember the first non-header line so we can fold it back into the
+    // voltage stream (the header loop has to consume it to detect the end
+    // of the header section).
+    let mut first_voltage_line: Option<&str> = None;
+
     // Header lines are "Key,Value" pairs. Labels are localized to the watch's
     // display language; see the *_LABELS constants at the top of this file.
     for line in lines.by_ref() {
-        let line = line.trim();
-        if line.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        if match_header(line, NAME_LABELS).is_some()
-            || match_header(line, DOB_LABELS).is_some()
+        if match_header(trimmed, NAME_LABELS).is_some()
+            || match_header(trimmed, DOB_LABELS).is_some()
         {
             // Skip name and date of birth for privacy.
             continue;
-        } else if let Some(raw) = match_header(line, RECORDED_DATE_LABELS) {
+        } else if let Some(raw) = match_header(trimmed, RECORDED_DATE_LABELS) {
             // Strip the timezone suffix (" +0000" / " -0500") so the value
-            // fits a naive TIMESTAMP column. (#4 will preserve the offset.)
+            // fits a naive TIMESTAMP column. (#4 was closed as out of scope.)
             recorded_date = if let Some(pos) = raw.rfind(" +") {
                 raw[..pos].to_string()
             } else if let Some(pos) = raw.rfind(" -") {
@@ -149,28 +157,31 @@ pub(crate) fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str)
             } else {
                 raw.to_string()
             };
-        } else if let Some(raw) = match_header(line, CLASSIFICATION_LABELS) {
+        } else if let Some(raw) = match_header(trimmed, CLASSIFICATION_LABELS) {
             classification = Some(raw.to_string());
-        } else if let Some(raw) = match_header(line, SYMPTOMS_LABELS) {
+        } else if let Some(raw) = match_header(trimmed, SYMPTOMS_LABELS) {
             if !raw.is_empty() {
                 symptoms = Some(raw.to_string());
             }
-        } else if let Some(raw) = match_header(line, SOFTWARE_VERSION_LABELS) {
+        } else if let Some(raw) = match_header(trimmed, SOFTWARE_VERSION_LABELS) {
             software_version = Some(raw.to_string());
-        } else if let Some(raw) = match_header(line, DEVICE_LABELS) {
+        } else if let Some(raw) = match_header(trimmed, DEVICE_LABELS) {
             // Remove surrounding quotes that Apple writes around the device
             // string (e.g. "Apple Watch").
             device = Some(raw.trim_matches('"').to_string());
-        } else if let Some(raw) = match_header(line, SAMPLE_RATE_LABELS) {
+        } else if let Some(raw) = match_header(trimmed, SAMPLE_RATE_LABELS) {
             // Extract the numeric part: "513.992 hertz" -> 513.992.
             sample_rate_hz = raw.split_whitespace().next().and_then(|s| s.parse().ok());
-        } else if match_header(line, LEAD_LABELS).is_some()
-            || match_header(line, UNIT_LABELS).is_some()
+        } else if match_header(trimmed, LEAD_LABELS).is_some()
+            || match_header(trimmed, UNIT_LABELS).is_some()
         {
             // Skip these informational header lines.
             continue;
         } else {
-            // First unrecognized line; assume the voltage section starts here.
+            // First unrecognized line; the voltage section starts here. Hand
+            // the original `line` (not `trimmed`) to the voltage loop so the
+            // trim happens once consistently below.
+            first_voltage_line = Some(line);
             break;
         }
     }
@@ -197,21 +208,20 @@ pub(crate) fn import_single_ecg(conn: &Connection, path: &Path, import_id: &str)
         appender.flush()?;
     }
 
-    // Parse voltage samples using Appender
-    let content = fs::read_to_string(path)?;
-    let mut in_data = false;
+    // Parse voltage samples. Replay the saved first voltage line, then the
+    // remaining lines from the same iterator — no second read of the file.
     let mut sample_idx = 0i32;
     let mut appender = conn.appender("ecg_samples")?;
-    for line in content.lines() {
+    for line in first_voltage_line.into_iter().chain(lines) {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if let Ok(voltage) = line.parse::<f64>() {
-            in_data = true;
             appender.append_row(duckdb::params![ecg_hash, sample_idx, voltage])?;
             sample_idx += 1;
-        } else if in_data {
+        } else {
+            // Mid-stream non-numeric line ends the voltage section.
             break;
         }
     }
