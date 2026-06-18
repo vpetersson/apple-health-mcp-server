@@ -10,6 +10,11 @@ use crate::models::{compute_hash, ImportStats};
 
 const BATCH_SIZE: usize = 100_000;
 
+/// Bail out of the XML stream if this many consecutive `read_event_into`
+/// errors fire. Without this, an unrecoverable parse error (corrupt input,
+/// stuck cursor) used to log a warning and `continue` forever — see issue #9.
+const MAX_CONSECUTIVE_XML_PARSE_ERRORS: usize = 100;
+
 fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
     e.attributes().filter_map(|a| a.ok()).find_map(|a| {
         if a.key.as_ref() == name {
@@ -72,8 +77,13 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     // also appear as top-level records
     let mut in_correlation = false;
 
+    // Bound on warn-and-continue: see MAX_CONSECUTIVE_XML_PARSE_ERRORS doc.
+    let mut consecutive_errors = 0usize;
+
     loop {
-        match xml.read_event_into(&mut buf) {
+        let result = xml.read_event_into(&mut buf);
+        let was_err = result.is_err();
+        match result {
             Ok(Event::Eof) => break,
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.name();
@@ -311,8 +321,24 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!("XML parse error: {:?}, continuing...", e);
+                consecutive_errors += 1;
+                tracing::warn!(
+                    "XML parse error: {:?} (consecutive: {}/{})",
+                    e,
+                    consecutive_errors,
+                    MAX_CONSECUTIVE_XML_PARSE_ERRORS
+                );
+                if consecutive_errors > MAX_CONSECUTIVE_XML_PARSE_ERRORS {
+                    anyhow::bail!(
+                        "Aborting XML import after {} consecutive parse errors (last: {:?})",
+                        consecutive_errors,
+                        e
+                    );
+                }
             }
+        }
+        if !was_err {
+            consecutive_errors = 0;
         }
         buf.clear();
     }
