@@ -230,6 +230,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                                 e,
                                 b"activeEnergyBurnedGoal",
                             )),
+                            active_energy_burned_unit: attr_value(e, b"activeEnergyBurnedUnit"),
                             apple_move_time: parse_opt_f64(&attr_value(e, b"appleMoveTime")),
                             apple_move_time_goal: parse_opt_f64(&attr_value(
                                 e,
@@ -390,6 +391,7 @@ struct ActivityRow {
     date_components: String,
     active_energy_burned: Option<f64>,
     active_energy_burned_goal: Option<f64>,
+    active_energy_burned_unit: Option<String>,
     apple_move_time: Option<f64>,
     apple_move_time_goal: Option<f64>,
     apple_exercise_time: Option<f64>,
@@ -520,6 +522,7 @@ fn flush_activities(conn: &Connection, batch: &mut Vec<ActivityRow>) -> Result<(
             a.date_components,
             a.active_energy_burned,
             a.active_energy_burned_goal,
+            a.active_energy_burned_unit,
             a.apple_move_time,
             a.apple_move_time_goal,
             a.apple_exercise_time,
@@ -610,7 +613,7 @@ mod tests {
  <Correlation type="HKCorrelationTypeIdentifierBloodPressure" sourceName="BP" startDate="2024-01-01 12:00:00 +0000" endDate="2024-01-01 12:00:00 +0000">
   <Record type="HKQuantityTypeIdentifierBloodPressureSystolic" sourceName="BP" unit="mmHg" value="120" startDate="2024-01-01 12:00:00 +0000" endDate="2024-01-01 12:00:00 +0000"/>
  </Correlation>
- <ActivitySummary dateComponents="2024-01-01" activeEnergyBurned="500" activeEnergyBurnedGoal="600" appleExerciseTime="30" appleExerciseTimeGoal="30" appleStandHours="10" appleStandHoursGoal="12"/>
+ <ActivitySummary dateComponents="2024-01-01" activeEnergyBurned="500" activeEnergyBurnedGoal="600" activeEnergyBurnedUnit="kcal" appleExerciseTime="30" appleExerciseTimeGoal="30" appleStandHours="10" appleStandHoursGoal="12"/>
 </HealthData>"#;
 
         let dir = tempfile::tempdir().unwrap();
@@ -642,5 +645,50 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM record_metadata", [], |row| row.get(0))
             .unwrap();
         assert_eq!(meta_count, 1);
+
+        // activeEnergyBurnedUnit now lands in the dedicated column so the
+        // unit travels with the value instead of being dropped on the floor.
+        let energy_unit: String = conn
+            .query_row(
+                "SELECT active_energy_burned_unit FROM activity_summaries
+                 WHERE date_components = '2024-01-01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(energy_unit, "kcal");
+    }
+
+    #[test]
+    fn import_xml_activity_summary_without_unit_stays_null() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        // Older exports (or third-party contributors) may omit the
+        // activeEnergyBurnedUnit attribute. The importer must leave the
+        // column NULL in that case rather than substituting an empty
+        // string, so downstream consumers can distinguish "missing" from
+        // "explicit empty".
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <ActivitySummary dateComponents="2024-02-02" activeEnergyBurned="400" activeEnergyBurnedGoal="500" appleExerciseTime="25" appleExerciseTimeGoal="30" appleStandHours="11" appleStandHoursGoal="12"/>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_no_unit").unwrap();
+        assert_eq!(stats.activity_summaries, 1);
+
+        let unit: Option<String> = conn
+            .query_row(
+                "SELECT active_energy_burned_unit FROM activity_summaries
+                 WHERE date_components = '2024-02-02'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unit.is_none());
     }
 }

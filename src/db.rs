@@ -80,16 +80,17 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS activity_summaries (
-            date_components          VARCHAR,
-            active_energy_burned     DOUBLE,
-            active_energy_burned_goal DOUBLE,
-            apple_move_time          DOUBLE,
-            apple_move_time_goal     DOUBLE,
-            apple_exercise_time      DOUBLE,
-            apple_exercise_time_goal DOUBLE,
-            apple_stand_hours        DOUBLE,
-            apple_stand_hours_goal   DOUBLE,
-            import_id                VARCHAR NOT NULL
+            date_components               VARCHAR,
+            active_energy_burned          DOUBLE,
+            active_energy_burned_goal     DOUBLE,
+            active_energy_burned_unit     VARCHAR,
+            apple_move_time               DOUBLE,
+            apple_move_time_goal          DOUBLE,
+            apple_exercise_time           DOUBLE,
+            apple_exercise_time_goal      DOUBLE,
+            apple_stand_hours             DOUBLE,
+            apple_stand_hours_goal        DOUBLE,
+            import_id                     VARCHAR NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS ecg_readings (

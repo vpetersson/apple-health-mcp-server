@@ -277,7 +277,7 @@ impl HealthServer {
     }
 
     #[tool(
-        description = "Get Apple Watch activity ring data. Returns: date_components, active_energy_burned, active_energy_burned_goal, apple_exercise_time, apple_exercise_time_goal, apple_stand_hours, apple_stand_hours_goal. Values are in kcal, minutes, and hours respectively."
+        description = "Get Apple Watch activity ring data. Returns: date_components, active_energy_burned, active_energy_burned_goal, active_energy_burned_unit (e.g. kcal — captured verbatim from the export so non-default-locale rings come back correctly), apple_exercise_time, apple_exercise_time_goal, apple_stand_hours, apple_stand_hours_goal. Values are in <unit>, minutes, and hours respectively."
     )]
     async fn get_activity_summaries(
         &self,
@@ -497,7 +497,7 @@ mod tests {
             INSERT INTO workouts VALUES ('wh1', 'HKWorkoutActivityTypeRunning', 1800.0, 'sec', 5000.0, 'm', 300.0, 'kcal', 'Apple Watch', '10.0', NULL, '2024-01-01 10:00:00', '2024-01-01 10:00:00', '2024-01-01 10:30:00', 'imp1');
             INSERT INTO workout_events VALUES ('wh1', 'HKWorkoutEventTypeLap', '2024-01-01 10:15:00', NULL, NULL);
             INSERT INTO workout_statistics VALUES ('wh1', 'HKQuantityTypeIdentifierHeartRate', '2024-01-01 10:00:00', '2024-01-01 10:30:00', 150.0, 120.0, 180.0, NULL, 'count/min');
-            INSERT INTO activity_summaries VALUES ('2024-01-01', 500.0, 600.0, 45.0, 30.0, 30.0, 30.0, 10.0, 12.0, 'imp1');
+            INSERT INTO activity_summaries VALUES ('2024-01-01', 500.0, 600.0, 'kcal', 45.0, 30.0, 30.0, 30.0, 10.0, 12.0, 'imp1');
             INSERT INTO ecg_readings VALUES ('ecg1', '2024-01-01 12:00:00', 'Sinus Rhythm', 'Apple Watch', 512.0, NULL, '2.0', 'imp1');
             INSERT INTO ecg_samples VALUES ('ecg1', 0, 100.0);
             INSERT INTO ecg_samples VALUES ('ecg1', 1, 200.0);
