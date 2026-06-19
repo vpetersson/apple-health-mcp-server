@@ -318,14 +318,24 @@ impl HealthServer {
     }
 
     #[tool(
-        description = "Get GPS route data for a workout. Returns array of: latitude, longitude, elevation (meters), timestamp, speed (m/s), course (degrees). Use get_workout_details first to check has_route."
+        description = "Get GPS route data for a workout. Returns array of: latitude, longitude, elevation (meters), timestamp, speed (m/s), course (degrees). Capped at `limit` rows (default 5000, max 50000); use `offset` to paginate longer routes. Use get_workout_details first to check has_route."
     )]
     async fn get_workout_route(&self, params: Parameters<GetWorkoutRouteParams>) -> String {
         let Parameters(params) = params;
-        match self.query_to_json(
-            "SELECT latitude, longitude, elevation, timestamp, speed, course FROM route_points WHERE workout_hash = ? ORDER BY timestamp",
-            &[&params.workout_hash as &dyn duckdb::ToSql],
-        ) {
+        // Long-form routes (multi-hour cycling) can produce tens of
+        // thousands of GPS samples. Capping the default response keeps
+        // tool calls within a reasonable LLM context budget; callers that
+        // need more can raise `limit` up to the hard ceiling or page with
+        // `offset`.
+        let limit = params.limit.unwrap_or(5000).min(50_000);
+        let offset = params.offset.unwrap_or(0);
+        let sql = format!(
+            "SELECT latitude, longitude, elevation, timestamp, speed, course \
+             FROM route_points WHERE workout_hash = ? \
+             ORDER BY timestamp LIMIT {} OFFSET {}",
+            limit, offset,
+        );
+        match self.query_to_json(&sql, &[&params.workout_hash as &dyn duckdb::ToSql]) {
             Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
             Err(e) => format!("Error: {}", e),
         }
@@ -761,10 +771,35 @@ mod tests {
         let server = setup_server();
         let params = Parameters(GetWorkoutRouteParams {
             workout_hash: "wh1".to_string(),
+            limit: None,
+            offset: None,
         });
         let result = server.get_workout_route(params).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_get_workout_route_respects_limit_offset() {
+        let server = setup_server();
+        let limited = Parameters(GetWorkoutRouteParams {
+            workout_hash: "wh1".to_string(),
+            limit: Some(1),
+            offset: None,
+        });
+        let result: Value =
+            serde_json::from_str(&server.get_workout_route(limited).await).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 1);
+
+        let offset = Parameters(GetWorkoutRouteParams {
+            workout_hash: "wh1".to_string(),
+            limit: Some(10),
+            offset: Some(1),
+        });
+        let result: Value =
+            serde_json::from_str(&server.get_workout_route(offset).await).unwrap();
+        // setup_server inserts two route points; offset 1 returns just one.
+        assert_eq!(result.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

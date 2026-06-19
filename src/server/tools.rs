@@ -63,6 +63,17 @@ pub struct GetActivitySummariesParams {
 pub struct GetWorkoutRouteParams {
     #[schemars(description = "The workout hash identifier")]
     pub workout_hash: String,
+    #[schemars(
+        description = "Maximum number of route points to return (default 5000, max 50000). \
+                       Long-form workouts can have tens of thousands of GPS samples; the \
+                       default keeps responses in a reasonable LLM context budget."
+    )]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "Skip the first N route points before returning the next `limit` rows. \
+                       Use with `limit` to paginate a long route in chunks."
+    )]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
