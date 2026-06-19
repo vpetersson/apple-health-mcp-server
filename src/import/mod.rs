@@ -11,7 +11,16 @@ use crate::db::{deduplicate_tables, ensure_schema, open_db, rebuild_daily_stats}
 
 pub fn run_import(export_dir: &Path, db_path: &Path) -> Result<()> {
     let start = std::time::Instant::now();
-    let import_id = format!("import_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+    // Include nanoseconds in the import id so two imports launched in the
+    // same wall-clock second (CI, scripted batches) don't collide. Two
+    // imports with the same id used to dedupe into one row in `imports`,
+    // losing the lineage of the older run.
+    let now = chrono::Utc::now();
+    let import_id = format!(
+        "import_{}_{:09}",
+        now.format("%Y%m%d_%H%M%S"),
+        now.timestamp_subsec_nanos()
+    );
 
     info!("Starting import {} from {:?}", import_id, export_dir);
 
