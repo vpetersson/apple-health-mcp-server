@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub struct ImportStats {
@@ -15,6 +16,14 @@ pub struct ImportStats {
     pub workout_statistics: u64,
     pub workout_metadata_entries: u64,
     pub workout_routes: u64,
+    /// Maps `FileReference` path (verbatim, including the leading
+    /// `/workout-routes/` prefix Apple emits) to the `workout_hash` of the
+    /// owning `<Workout>`. Built while we already hold the workout in scope
+    /// during the single XML scan, replacing the legacy second scan in
+    /// `import::build_workout_route_map`. The map is consumed by the GPX
+    /// importer so route points land on the same `workout_hash` value the
+    /// XML importer produced for the workout.
+    pub workout_route_map: HashMap<String, String>,
 }
 
 pub fn compute_hash(parts: &[&str]) -> String {

@@ -316,6 +316,20 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         // confuse the join against route_points later.
                         if let Some(wr) = current_workout_route.take() {
                             if !wr.file_path.is_empty() {
+                                // Build the file-path -> workout_hash map
+                                // inline while we already hold the matching
+                                // workout in scope. The legacy
+                                // build_workout_route_map() re-scanned the
+                                // whole XML and recomputed the hash from raw
+                                // (non-clean_date'd) dates, producing a
+                                // value that never matched the workouts
+                                // table -- which is why every route_points
+                                // row was orphaned. Inserting here uses the
+                                // exact same hash the workout itself was
+                                // stored under.
+                                stats
+                                    .workout_route_map
+                                    .insert(wr.file_path.clone(), wr.workout_hash.clone());
                                 workout_route_batch.push(wr);
                                 stats.workout_routes += 1;
                                 if workout_route_batch.len() >= BATCH_SIZE {
