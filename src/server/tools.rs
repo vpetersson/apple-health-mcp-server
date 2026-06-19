@@ -84,3 +84,23 @@ pub struct RunCustomQueryParams {
     #[schemars(description = "A read-only SQL query (must start with SELECT or WITH)")]
     pub query: String,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListCorrelationsParams {
+    #[schemars(
+        description = "Filter by correlation type (e.g. HKCorrelationTypeIdentifierBloodPressure)"
+    )]
+    pub correlation_type: Option<String>,
+    #[schemars(description = "Start date filter (ISO 8601 / YYYY-MM-DD)")]
+    pub start_date: Option<String>,
+    #[schemars(description = "End date filter (ISO 8601 / YYYY-MM-DD)")]
+    pub end_date: Option<String>,
+    #[schemars(description = "Maximum number of results (default 50, max 500)")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetCorrelationDetailsParams {
+    #[schemars(description = "The correlation hash identifier")]
+    pub correlation_hash: String,
+}

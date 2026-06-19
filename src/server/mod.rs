@@ -322,6 +322,77 @@ impl HealthServer {
     }
 
     #[tool(
+        description = "List Correlation groupings (e.g. HKCorrelationTypeIdentifierBloodPressure pairs a Systolic and a Diastolic record taken in the same reading, HKCorrelationTypeIdentifierFood groups a meal's nutrient breakdown). Returns: correlation_hash, correlation_type, source_name, start_date, end_date. Use correlation_hash with get_correlation_details to fetch the joined member records (e.g. matched Systolic + Diastolic values)."
+    )]
+    async fn list_correlations(&self, params: Parameters<ListCorrelationsParams>) -> String {
+        let Parameters(params) = params;
+        let limit = params.limit.unwrap_or(50).min(500);
+        let mut sql = String::from(
+            "SELECT correlation_hash, correlation_type, source_name, start_date, end_date \
+             FROM correlations WHERE 1=1",
+        );
+        if let Some(ref ct) = params.correlation_type {
+            sql.push_str(&format!(
+                " AND correlation_type = '{}'",
+                ct.replace('\'', "''")
+            ));
+        }
+        if let Some(ref sd) = params.start_date {
+            sql.push_str(&format!(" AND start_date >= '{}'", sd.replace('\'', "''")));
+        }
+        if let Some(ref ed) = params.end_date {
+            sql.push_str(&format!(" AND end_date <= '{}'", ed.replace('\'', "''")));
+        }
+        sql.push_str(&format!(" ORDER BY start_date DESC LIMIT {}", limit));
+        match self.query_to_json(&sql, &[]) {
+            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    #[tool(
+        description = "Get the full member set of a Correlation (e.g. all records in a blood-pressure reading or a meal). Returns: correlation object (correlation_hash, correlation_type, source_name, start_date, end_date), and members array of {record_hash, record_type, value, unit, start_date, end_date}. For a blood-pressure correlation the members will include both the Systolic and Diastolic Records joined from the records table."
+    )]
+    async fn get_correlation_details(
+        &self,
+        params: Parameters<GetCorrelationDetailsParams>,
+    ) -> String {
+        let Parameters(params) = params;
+        let hash = params.correlation_hash;
+
+        let correlation = match self.query_to_json(
+            "SELECT correlation_hash, correlation_type, source_name, source_version, \
+                    creation_date, start_date, end_date \
+             FROM correlations WHERE correlation_hash = ?",
+            &[&hash as &dyn duckdb::ToSql],
+        ) {
+            Ok(r) => r,
+            Err(e) => return format!("Error: {}", e),
+        };
+
+        // Join members against the records table so the caller gets the
+        // measurements inline rather than just record_hash references.
+        let members = match self.query_to_json(
+            "SELECT r.record_hash, r.record_type, r.value, r.unit, \
+                    r.start_date, r.end_date \
+             FROM correlation_members cm \
+             JOIN records r ON r.record_hash = cm.record_hash \
+             WHERE cm.correlation_hash = ? \
+             ORDER BY r.record_type",
+            &[&hash as &dyn duckdb::ToSql],
+        ) {
+            Ok(r) => r,
+            Err(e) => return format!("Error: {}", e),
+        };
+
+        let result = json!({
+            "correlation": correlation.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
+            "members": members,
+        });
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    }
+
+    #[tool(
         description = "List ECG recordings. Returns: ecg_hash, recorded_date, classification (e.g. SinusRhythm, AtrialFibrillation), device, sample_rate_hz. Use ecg_hash with get_ecg_data."
     )]
     async fn list_ecg_readings(&self, params: Parameters<ListEcgReadingsParams>) -> String {
@@ -504,6 +575,11 @@ mod tests {
             INSERT INTO ecg_samples VALUES ('ecg1', 2, -50.0);
             INSERT INTO route_points VALUES ('rp1', 'wh1', 37.7749, -122.4194, 10.5, '2024-01-01 10:00:00', 3.5, 180.0, 5.0, 3.0, 'imp1');
             INSERT INTO route_points VALUES ('rp2', 'wh1', 37.7750, -122.4195, 11.0, '2024-01-01 10:00:05', 3.6, 181.0, 4.5, 2.8, 'imp1');
+            INSERT INTO records VALUES ('rbp_s', 'HKQuantityTypeIdentifierBloodPressureSystolic', 130.0, 'mmHg', 'BP', '1.0', NULL, '2024-01-02 07:00:00', '2024-01-02 07:00:00', '2024-01-02 07:00:00', 'imp1');
+            INSERT INTO records VALUES ('rbp_d', 'HKQuantityTypeIdentifierBloodPressureDiastolic', 80.0, 'mmHg', 'BP', '1.0', NULL, '2024-01-02 07:00:00', '2024-01-02 07:00:00', '2024-01-02 07:00:00', 'imp1');
+            INSERT INTO correlations VALUES ('cor_bp', 'HKCorrelationTypeIdentifierBloodPressure', 'BP', '1.0', NULL, NULL, '2024-01-02 07:00:00', '2024-01-02 07:00:00', 'imp1');
+            INSERT INTO correlation_members VALUES ('cor_bp', 'rbp_s', 'imp1');
+            INSERT INTO correlation_members VALUES ('cor_bp', 'rbp_d', 'imp1');
             INSERT INTO imports VALUES ('imp1', '/tmp/export', '2024-01-01 00:00:00', 3, 1, 5.0);
             ",
         )
@@ -731,6 +807,66 @@ mod tests {
         let result = server.get_workout_route(params).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_list_correlations() {
+        let server = setup_server();
+        let params = Parameters(ListCorrelationsParams {
+            correlation_type: Some("HKCorrelationTypeIdentifierBloodPressure".to_string()),
+            start_date: None,
+            end_date: None,
+            limit: None,
+        });
+        let result = server.list_correlations(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("correlation_type").unwrap().as_str().unwrap(),
+            "HKCorrelationTypeIdentifierBloodPressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_get_correlation_details_blood_pressure() {
+        let server = setup_server();
+        let params = Parameters(GetCorrelationDetailsParams {
+            correlation_hash: "cor_bp".to_string(),
+        });
+        let result = server.get_correlation_details(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("correlation").unwrap().is_object());
+
+        // Members must join cleanly against records, exposing both the
+        // Systolic and Diastolic measurements with their values intact.
+        let members = parsed.get("members").unwrap().as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        let types: Vec<&str> = members
+            .iter()
+            .map(|m| m.get("record_type").unwrap().as_str().unwrap())
+            .collect();
+        assert!(types.iter().any(|t| t.contains("BloodPressureSystolic")));
+        assert!(types.iter().any(|t| t.contains("BloodPressureDiastolic")));
+    }
+
+    #[tokio::test]
+    async fn tool_get_correlation_details_unknown() {
+        let server = setup_server();
+        let params = Parameters(GetCorrelationDetailsParams {
+            correlation_hash: "no_such_hash".to_string(),
+        });
+        let result = server.get_correlation_details(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        // Missing correlations must surface as a null correlation object
+        // and an empty member array so clients see a stable shape.
+        assert!(parsed.get("correlation").unwrap().is_null());
+        assert!(parsed
+            .get("members")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
