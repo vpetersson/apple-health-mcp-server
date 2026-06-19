@@ -56,6 +56,8 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     let mut workout_batch: Vec<WorkoutRow> = Vec::with_capacity(BATCH_SIZE);
     let mut workout_event_batch: Vec<WorkoutEventRow> = Vec::with_capacity(BATCH_SIZE);
     let mut workout_stat_batch: Vec<WorkoutStatRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut workout_metadata_batch: Vec<WorkoutMetadataRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut workout_route_batch: Vec<WorkoutRouteRow> = Vec::with_capacity(BATCH_SIZE);
     let mut activity_batch: Vec<ActivityRow> = Vec::with_capacity(BATCH_SIZE);
 
     // State for nested parsing
@@ -63,7 +65,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     let mut current_workout: Option<WorkoutRow> = None;
     let mut current_workout_events: Vec<WorkoutEventRow> = Vec::new();
     let mut current_workout_stats: Vec<WorkoutStatRow> = Vec::new();
-    let mut _current_workout_route_file: Option<String> = None;
+    let mut current_workout_metadata: Vec<WorkoutMetadataRow> = Vec::new();
+    let mut current_workout_route: Option<WorkoutRouteRow> = None;
+    let mut in_workout_route = false;
 
     let mut in_record = false;
     let mut current_record_hash: Option<String> = None;
@@ -131,7 +135,21 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         let value = attr_value(e, b"value").unwrap_or_default();
 
                         if in_workout {
-                            // Skip workout metadata for now (could store if needed)
+                            // MetadataEntry inside <Workout> carries
+                            // workout-level context (HKIndoorWorkout,
+                            // HKAverageMETs, HKWeather*, HKElevationAscended,
+                            // and third-party app keys). Buffer per workout
+                            // and flush together with the workout so a
+                            // workout that fails to close does not leak
+                            // orphaned metadata rows.
+                            if let Some(ref w) = current_workout {
+                                current_workout_metadata.push(WorkoutMetadataRow {
+                                    workout_hash: w.workout_hash.clone(),
+                                    key,
+                                    value: Some(value),
+                                    import_id: import_id.to_string(),
+                                });
+                            }
                         } else if in_record {
                             if let Some(ref hash) = current_record_hash {
                                 metadata_batch.push(MetadataRow {
@@ -187,7 +205,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         });
                         current_workout_events.clear();
                         current_workout_stats.clear();
-                        _current_workout_route_file = None;
+                        current_workout_metadata.clear();
+                        current_workout_route = None;
+                        in_workout_route = false;
                     }
                     b"WorkoutEvent" if in_workout => {
                         if let Some(ref w) = current_workout {
@@ -215,8 +235,27 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             });
                         }
                     }
-                    b"FileReference" if in_workout => {
-                        _current_workout_route_file = attr_value(e, b"path");
+                    b"WorkoutRoute" if in_workout => {
+                        if let Some(ref w) = current_workout {
+                            in_workout_route = true;
+                            current_workout_route = Some(WorkoutRouteRow {
+                                workout_hash: w.workout_hash.clone(),
+                                file_path: String::new(),
+                                source_name: attr_value(e, b"sourceName"),
+                                source_version: attr_value(e, b"sourceVersion"),
+                                creation_date: clean_date_opt(&attr_value(e, b"creationDate")),
+                                start_date: clean_date_opt(&attr_value(e, b"startDate")),
+                                end_date: clean_date_opt(&attr_value(e, b"endDate")),
+                                import_id: import_id.to_string(),
+                            });
+                        }
+                    }
+                    b"FileReference" if in_workout_route => {
+                        if let Some(ref mut wr) = current_workout_route {
+                            if let Some(path) = attr_value(e, b"path") {
+                                wr.file_path = path;
+                            }
+                        }
                     }
                     b"ActivitySummary" => {
                         let date_comp = attr_value(e, b"dateComponents").unwrap_or_default();
@@ -270,6 +309,22 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         in_record = false;
                         current_record_hash = None;
                     }
+                    b"WorkoutRoute" => {
+                        // Only commit the route row once a FileReference
+                        // child has populated `file_path`. A WorkoutRoute
+                        // without a file reference is malformed and would
+                        // confuse the join against route_points later.
+                        if let Some(wr) = current_workout_route.take() {
+                            if !wr.file_path.is_empty() {
+                                workout_route_batch.push(wr);
+                                stats.workout_routes += 1;
+                                if workout_route_batch.len() >= BATCH_SIZE {
+                                    flush_workout_routes(conn, &mut workout_route_batch)?;
+                                }
+                            }
+                        }
+                        in_workout_route = false;
+                    }
                     b"Workout" => {
                         if let Some(w) = current_workout.take() {
                             workout_batch.push(w);
@@ -283,6 +338,10 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                                 workout_stat_batch.push(st);
                                 stats.workout_statistics += 1;
                             }
+                            for md in current_workout_metadata.drain(..) {
+                                workout_metadata_batch.push(md);
+                                stats.workout_metadata_entries += 1;
+                            }
 
                             if workout_batch.len() >= BATCH_SIZE {
                                 flush_workouts(conn, &mut workout_batch)?;
@@ -292,6 +351,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             }
                             if workout_stat_batch.len() >= BATCH_SIZE {
                                 flush_workout_stats(conn, &mut workout_stat_batch)?;
+                            }
+                            if workout_metadata_batch.len() >= BATCH_SIZE {
+                                flush_workout_metadata(conn, &mut workout_metadata_batch)?;
                             }
                         }
                         in_workout = false;
@@ -316,11 +378,18 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     flush_workouts(conn, &mut workout_batch)?;
     flush_workout_events(conn, &mut workout_event_batch)?;
     flush_workout_stats(conn, &mut workout_stat_batch)?;
+    flush_workout_metadata(conn, &mut workout_metadata_batch)?;
+    flush_workout_routes(conn, &mut workout_route_batch)?;
     flush_activities(conn, &mut activity_batch)?;
 
     info!(
-        "XML import complete: {} records, {} workouts, {} activity summaries, {} correlations",
-        stats.records, stats.workouts, stats.activity_summaries, stats.correlations
+        "XML import complete: {} records, {} workouts ({} metadata entries, {} routes), {} activity summaries, {} correlations",
+        stats.records,
+        stats.workouts,
+        stats.workout_metadata_entries,
+        stats.workout_routes,
+        stats.activity_summaries,
+        stats.correlations,
     );
 
     Ok(stats)
@@ -384,6 +453,24 @@ struct WorkoutStatRow {
     maximum: Option<f64>,
     sum: Option<f64>,
     unit: Option<String>,
+}
+
+struct WorkoutMetadataRow {
+    workout_hash: String,
+    key: String,
+    value: Option<String>,
+    import_id: String,
+}
+
+struct WorkoutRouteRow {
+    workout_hash: String,
+    file_path: String,
+    source_name: Option<String>,
+    source_version: Option<String>,
+    creation_date: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    import_id: String,
 }
 
 struct ActivityRow {
@@ -510,6 +597,41 @@ fn flush_workout_stats(conn: &Connection, batch: &mut Vec<WorkoutStatRow>) -> Re
     Ok(())
 }
 
+fn flush_workout_metadata(conn: &Connection, batch: &mut Vec<WorkoutMetadataRow>) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut appender = conn.appender("workout_metadata")?;
+    for m in batch.iter() {
+        appender.append_row(duckdb::params![m.workout_hash, m.key, m.value, m.import_id,])?;
+    }
+    appender.flush()?;
+    batch.clear();
+    Ok(())
+}
+
+fn flush_workout_routes(conn: &Connection, batch: &mut Vec<WorkoutRouteRow>) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut appender = conn.appender("workout_routes")?;
+    for r in batch.iter() {
+        appender.append_row(duckdb::params![
+            r.workout_hash,
+            r.file_path,
+            r.source_name,
+            r.source_version,
+            r.creation_date,
+            r.start_date,
+            r.end_date,
+            r.import_id,
+        ])?;
+    }
+    appender.flush()?;
+    batch.clear();
+    Ok(())
+}
+
 fn flush_activities(conn: &Connection, batch: &mut Vec<ActivityRow>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -626,6 +748,7 @@ mod tests {
         assert_eq!(stats.metadata_entries, 1);
         assert_eq!(stats.workout_events, 1);
         assert_eq!(stats.workout_statistics, 1);
+        assert_eq!(stats.workout_routes, 1);
 
         // Verify data in DB
         let rec_count: i64 = conn
@@ -642,5 +765,118 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM record_metadata", [], |row| row.get(0))
             .unwrap();
         assert_eq!(meta_count, 1);
+
+        let route_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workout_routes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(route_count, 1);
+        let route_path: String = conn
+            .query_row("SELECT file_path FROM workout_routes LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(route_path, "/workout-routes/route_2024-01-01.gpx");
+    }
+
+    #[test]
+    fn import_xml_workout_metadata_persisted() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30" durationUnit="min" sourceName="Watch" startDate="2024-02-02 06:00:00 +0000" endDate="2024-02-02 06:30:00 +0000">
+  <MetadataEntry key="HKIndoorWorkout" value="0"/>
+  <MetadataEntry key="HKAverageMETs" value="7.5 kcal/hr·kg"/>
+  <MetadataEntry key="HKWeatherTemperature" value="18 degF"/>
+ </Workout>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_meta").unwrap();
+        assert_eq!(stats.workouts, 1);
+        assert_eq!(stats.workout_metadata_entries, 3);
+        // Record-level metadata counter must stay zero: the entries belong to
+        // a Workout, not a Record.
+        assert_eq!(stats.metadata_entries, 0);
+
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workout_metadata", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 3);
+
+        let indoor: String = conn
+            .query_row(
+                "SELECT value FROM workout_metadata WHERE key = 'HKIndoorWorkout'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indoor, "0");
+    }
+
+    #[test]
+    fn import_xml_workout_route_links_to_workout_hash() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Workout workoutActivityType="HKWorkoutActivityTypeCycling" duration="60" durationUnit="min" sourceName="Watch" startDate="2024-03-03 07:00:00 +0000" endDate="2024-03-03 08:00:00 +0000">
+  <WorkoutRoute sourceName="Watch" sourceVersion="10.2" creationDate="2024-03-03 08:00:00 +0000" startDate="2024-03-03 07:00:00 +0000" endDate="2024-03-03 08:00:00 +0000">
+   <FileReference path="/workout-routes/route_2024-03-03.gpx"/>
+  </WorkoutRoute>
+ </Workout>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_route").unwrap();
+        assert_eq!(stats.workouts, 1);
+        assert_eq!(stats.workout_routes, 1);
+
+        // workout_routes.workout_hash must match the inserted workouts row
+        // exactly; the previous build_workout_route_map() implementation
+        // mis-hashed by skipping clean_date() and produced 100% orphans.
+        let (wh_from_workouts, wh_from_routes): (String, String) = conn
+            .query_row(
+                "SELECT w.workout_hash, wr.workout_hash
+                 FROM workouts w
+                 JOIN workout_routes wr ON wr.workout_hash = w.workout_hash",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(wh_from_workouts, wh_from_routes);
+    }
+
+    #[test]
+    fn import_xml_workout_route_without_file_reference_is_dropped() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30" durationUnit="min" sourceName="Watch" startDate="2024-04-04 06:00:00 +0000" endDate="2024-04-04 06:30:00 +0000">
+  <WorkoutRoute sourceName="Watch"/>
+ </Workout>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_no_ref").unwrap();
+        // A WorkoutRoute without a FileReference cannot be joined to a GPX
+        // payload and is dropped on the floor rather than inserted with an
+        // empty file_path that would silently break joins later.
+        assert_eq!(stats.workout_routes, 0);
     }
 }
