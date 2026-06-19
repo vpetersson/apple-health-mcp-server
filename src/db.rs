@@ -218,6 +218,28 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
             ORDER BY workout_hash, file_path, import_id DESC
         );
 
+        -- workout_events and workout_statistics carry no import_id column,
+        -- so the dedupe key has to come from the row's own structure. Apple
+        -- Health spec emits at most one event per (workout, type, date) and
+        -- one statistic per (workout, stat_type) — re-importing the same
+        -- export collapses cleanly under those keys. Without these dedupes
+        -- a second import doubled workouts.total_distance /
+        -- total_energy_burned, because populate_workout_vestigial_columns
+        -- sums over a now-duplicated workout_statistics.
+        CREATE OR REPLACE TABLE workout_events AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (workout_hash, event_type, date) *
+            FROM workout_events
+            ORDER BY workout_hash, event_type, date
+        );
+
+        CREATE OR REPLACE TABLE workout_statistics AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (workout_hash, stat_type) *
+            FROM workout_statistics
+            ORDER BY workout_hash, stat_type, start_date
+        );
+
         CREATE OR REPLACE TABLE imports AS
         SELECT * FROM (
             SELECT DISTINCT ON (import_id) *
@@ -516,6 +538,118 @@ mod tests {
             )
             .unwrap();
         assert!((avg - 76.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn deduplicate_collapses_workout_statistics_on_reimport() {
+        // Re-importing the same export used to leave workout_statistics with
+        // every row duplicated. populate_workout_vestigial_columns SUM()s
+        // across the table, so the duplication leaked into workouts.
+        // total_distance and total_energy_burned, multiplying them by the
+        // number of imports. This regression test fixes the dedupe at the
+        // statistics layer so re-imports stay idempotent.
+        let conn = setup();
+        conn.execute_batch(
+            "
+            INSERT INTO workout_statistics VALUES
+              ('wh1', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2024-01-01 10:00:00', '2024-01-01 10:30:00',
+               NULL, NULL, NULL, 300.0, 'kcal'),
+              ('wh1', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2024-01-01 10:00:00', '2024-01-01 10:30:00',
+               NULL, NULL, NULL, 300.0, 'kcal'),
+              ('wh1', 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+               '2024-01-01 10:00:00', '2024-01-01 10:30:00',
+               NULL, NULL, NULL, 5.0, 'km'),
+              ('wh1', 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+               '2024-01-01 10:00:00', '2024-01-01 10:30:00',
+               NULL, NULL, NULL, 5.0, 'km');
+            ",
+        )
+        .unwrap();
+
+        deduplicate_tables(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workout_statistics", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn deduplicate_collapses_workout_events_on_reimport() {
+        let conn = setup();
+        conn.execute_batch(
+            "
+            INSERT INTO workout_events VALUES
+              ('wh1', 'HKWorkoutEventTypeLap',
+               '2024-01-01 10:15:00', NULL, NULL),
+              ('wh1', 'HKWorkoutEventTypeLap',
+               '2024-01-01 10:15:00', NULL, NULL),
+              ('wh1', 'HKWorkoutEventTypePause',
+               '2024-01-01 10:20:00', 5.0, 'min');
+            ",
+        )
+        .unwrap();
+
+        deduplicate_tables(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workout_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn vestigial_column_backfill_stays_idempotent_under_duplicate_stats() {
+        // End-to-end guard: even if workout_statistics contained the
+        // duplicate set from a stale import (e.g. an import that happened
+        // before this dedupe shipped), running deduplicate_tables before
+        // populate_workout_vestigial_columns must produce the original
+        // unit value, not a multiple of it.
+        let conn = setup();
+        conn.execute_batch(
+            "
+            INSERT INTO workouts VALUES
+              ('wh_run', 'HKWorkoutActivityTypeRunning', 1800, 's',
+               NULL, NULL, NULL, NULL,
+               'Watch', '11', 'iPhone', '2024-01-01 06:00:00',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00', 'imp1');
+
+            INSERT INTO workout_statistics VALUES
+              ('wh_run', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00',
+               NULL, NULL, NULL, 240.5, 'kcal'),
+              ('wh_run', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00',
+               NULL, NULL, NULL, 240.5, 'kcal'),
+              ('wh_run', 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00',
+               NULL, NULL, NULL, 3.2, 'km'),
+              ('wh_run', 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00',
+               NULL, NULL, NULL, 3.2, 'km');
+            ",
+        )
+        .unwrap();
+
+        deduplicate_tables(&conn).unwrap();
+        populate_workout_vestigial_columns(&conn).unwrap();
+
+        let (energy, distance): (f64, f64) = conn
+            .query_row(
+                "SELECT total_energy_burned, total_distance
+                 FROM workouts WHERE workout_hash = 'wh_run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        // Without dedupe of workout_statistics these would come back as
+        // 481.0 and 6.4 (2x the truth). With dedupe the values are exact.
+        assert!((energy - 240.5).abs() < 1e-6);
+        assert!((distance - 3.2).abs() < 1e-6);
     }
 
     #[test]
