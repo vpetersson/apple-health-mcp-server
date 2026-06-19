@@ -322,6 +322,29 @@ impl HealthServer {
     }
 
     #[tool(
+        description = "Get beat-level heart-rate samples attached to a parent HR or HRV record. Returns an array of {sample_idx, bpm, sample_time} where sample_time is the relative HH:MM:SS.SSS offset Apple emits. Use this to reconstruct HRV metrics (RMSSD, pNN50, LF/HF) from a HKQuantityTypeIdentifierHeartRateVariabilitySDNN record, or to inspect the per-beat distribution behind an averaged HKQuantityTypeIdentifierHeartRate record (peak vs. average bpm within a window). The parent record_hash comes from query_records on those record types. Default limit 1000, max 10000."
+    )]
+    async fn get_heart_rate_samples(
+        &self,
+        params: Parameters<GetHeartRateSamplesParams>,
+    ) -> String {
+        let Parameters(params) = params;
+        let limit = params.limit.unwrap_or(1000).min(10_000);
+        let sql = format!(
+            "SELECT sample_idx, bpm, sample_time \
+             FROM heart_rate_samples \
+             WHERE parent_record_hash = ? \
+             ORDER BY sample_idx \
+             LIMIT {}",
+            limit
+        );
+        match self.query_to_json(&sql, &[&params.record_hash as &dyn duckdb::ToSql]) {
+            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    #[tool(
         description = "List ECG recordings. Returns: ecg_hash, recorded_date, classification (e.g. SinusRhythm, AtrialFibrillation), device, sample_rate_hz. Use ecg_hash with get_ecg_data."
     )]
     async fn list_ecg_readings(&self, params: Parameters<ListEcgReadingsParams>) -> String {
@@ -504,6 +527,9 @@ mod tests {
             INSERT INTO ecg_samples VALUES ('ecg1', 2, -50.0);
             INSERT INTO route_points VALUES ('rp1', 'wh1', 37.7749, -122.4194, 10.5, '2024-01-01 10:00:00', 3.5, 180.0, 5.0, 3.0, 'imp1');
             INSERT INTO route_points VALUES ('rp2', 'wh1', 37.7750, -122.4195, 11.0, '2024-01-01 10:00:05', 3.6, 181.0, 4.5, 2.8, 'imp1');
+            INSERT INTO heart_rate_samples VALUES ('rh1', 0, 70.0, '08:00:00.000', 'imp1');
+            INSERT INTO heart_rate_samples VALUES ('rh1', 1, 72.5, '08:00:01.500', 'imp1');
+            INSERT INTO heart_rate_samples VALUES ('rh1', 2, 75.0, '08:00:03.000', 'imp1');
             INSERT INTO imports VALUES ('imp1', '/tmp/export', '2024-01-01 00:00:00', 3, 1, 5.0);
             ",
         )
@@ -731,6 +757,49 @@ mod tests {
         let result = server.get_workout_route(params).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_get_heart_rate_samples() {
+        let server = setup_server();
+        let params = Parameters(GetHeartRateSamplesParams {
+            record_hash: "rh1".to_string(),
+            limit: None,
+        });
+        let result = server.get_heart_rate_samples(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let arr = parsed.as_array().unwrap();
+        // Three samples seeded against rh1; sample_idx must come back in
+        // ascending order so HRV reconstruction sees the original
+        // beat sequence.
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].get("sample_idx").unwrap().as_i64().unwrap(), 0);
+        assert_eq!(arr[2].get("sample_idx").unwrap().as_i64().unwrap(), 2);
+        assert!(arr[0].get("bpm").unwrap().as_f64().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn tool_get_heart_rate_samples_respects_limit() {
+        let server = setup_server();
+        let params = Parameters(GetHeartRateSamplesParams {
+            record_hash: "rh1".to_string(),
+            limit: Some(2),
+        });
+        let result = server.get_heart_rate_samples(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_get_heart_rate_samples_unknown_record() {
+        let server = setup_server();
+        let params = Parameters(GetHeartRateSamplesParams {
+            record_hash: "no_such_hash".to_string(),
+            limit: None,
+        });
+        let result = server.get_heart_rate_samples(params).await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

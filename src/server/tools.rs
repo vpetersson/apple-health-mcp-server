@@ -84,3 +84,11 @@ pub struct RunCustomQueryParams {
     #[schemars(description = "A read-only SQL query (must start with SELECT or WITH)")]
     pub query: String,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetHeartRateSamplesParams {
+    #[schemars(description = "The parent HR or HRV record hash to fetch beat-level samples for")]
+    pub record_hash: String,
+    #[schemars(description = "Maximum number of samples to return (default 1000, max 10000)")]
+    pub limit: Option<u32>,
+}
