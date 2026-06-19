@@ -13,6 +13,7 @@ pub struct ImportStats {
     pub metadata_entries: u64,
     pub workout_events: u64,
     pub workout_statistics: u64,
+    pub correlation_members: u64,
 }
 
 pub fn compute_hash(parts: &[&str]) -> String {
@@ -74,5 +75,6 @@ mod tests {
         assert_eq!(stats.metadata_entries, 0);
         assert_eq!(stats.workout_events, 0);
         assert_eq!(stats.workout_statistics, 0);
+        assert_eq!(stats.correlation_members, 0);
     }
 }

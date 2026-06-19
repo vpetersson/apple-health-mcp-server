@@ -123,6 +123,24 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             import_id     VARCHAR NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS correlations (
+            correlation_hash    VARCHAR NOT NULL,
+            correlation_type    VARCHAR NOT NULL,
+            source_name         VARCHAR,
+            source_version      VARCHAR,
+            device              VARCHAR,
+            creation_date       TIMESTAMP,
+            start_date          TIMESTAMP NOT NULL,
+            end_date            TIMESTAMP NOT NULL,
+            import_id           VARCHAR NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS correlation_members (
+            correlation_hash    VARCHAR NOT NULL,
+            record_hash         VARCHAR NOT NULL,
+            import_id           VARCHAR NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS imports (
             import_id    VARCHAR,
             export_dir   VARCHAR NOT NULL,
@@ -186,6 +204,20 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
             FROM route_points
         );
 
+        CREATE OR REPLACE TABLE correlations AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (correlation_hash) *
+            FROM correlations
+            ORDER BY correlation_hash, import_id DESC
+        );
+
+        CREATE OR REPLACE TABLE correlation_members AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (correlation_hash, record_hash) *
+            FROM correlation_members
+            ORDER BY correlation_hash, record_hash, import_id DESC
+        );
+
         CREATE OR REPLACE TABLE imports AS
         SELECT * FROM (
             SELECT DISTINCT ON (import_id) *
@@ -197,6 +229,9 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_records_source ON records(source_name);
         CREATE INDEX IF NOT EXISTS idx_workouts_type_date ON workouts(activity_type, start_date);
         CREATE INDEX IF NOT EXISTS idx_route_points_workout ON route_points(workout_hash);
+        CREATE INDEX IF NOT EXISTS idx_correlations_type_date ON correlations(correlation_type, start_date);
+        CREATE INDEX IF NOT EXISTS idx_correlation_members_correlation ON correlation_members(correlation_hash);
+        CREATE INDEX IF NOT EXISTS idx_correlation_members_record ON correlation_members(record_hash);
         ",
     )?;
 
@@ -252,8 +287,9 @@ mod tests {
             )
             .unwrap();
         // records, record_metadata, workouts, workout_events, workout_statistics,
-        // activity_summaries, ecg_readings, ecg_samples, route_points, imports = 10
-        assert_eq!(count, 10);
+        // activity_summaries, ecg_readings, ecg_samples, route_points,
+        // correlations, correlation_members, imports = 12
+        assert_eq!(count, 12);
     }
 
     #[test]
@@ -267,7 +303,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 12);
     }
 
     #[test]
