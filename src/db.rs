@@ -141,24 +141,31 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
     info!("Deduplicating tables...");
 
+    // Every `DISTINCT ON` carries an explicit `ORDER BY` so the row that
+    // wins for a given key is deterministic across re-imports. The tie-break
+    // prefers the most recent `import_id` so re-importing the same export
+    // never silently flips `source_version` / `device` / etc.
     conn.execute_batch(
         "
         CREATE OR REPLACE TABLE records AS
         SELECT * FROM (
             SELECT DISTINCT ON (record_hash) *
             FROM records
+            ORDER BY record_hash, import_id DESC, creation_date DESC
         );
 
         CREATE OR REPLACE TABLE record_metadata AS
         SELECT * FROM (
             SELECT DISTINCT ON (record_hash, key) *
             FROM record_metadata
+            ORDER BY record_hash, key, value
         );
 
         CREATE OR REPLACE TABLE workouts AS
         SELECT * FROM (
             SELECT DISTINCT ON (workout_hash) *
             FROM workouts
+            ORDER BY workout_hash, import_id DESC, creation_date DESC
         );
 
         CREATE OR REPLACE TABLE activity_summaries AS
@@ -172,24 +179,28 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
         SELECT * FROM (
             SELECT DISTINCT ON (ecg_hash) *
             FROM ecg_readings
+            ORDER BY ecg_hash, import_id DESC
         );
 
         CREATE OR REPLACE TABLE ecg_samples AS
         SELECT * FROM (
             SELECT DISTINCT ON (ecg_hash, sample_idx) *
             FROM ecg_samples
+            ORDER BY ecg_hash, sample_idx, voltage_uv
         );
 
         CREATE OR REPLACE TABLE route_points AS
         SELECT * FROM (
             SELECT DISTINCT ON (point_hash) *
             FROM route_points
+            ORDER BY point_hash, import_id DESC
         );
 
         CREATE OR REPLACE TABLE imports AS
         SELECT * FROM (
             SELECT DISTINCT ON (import_id) *
             FROM imports
+            ORDER BY import_id, imported_at DESC
         );
 
         -- Now add indexes
