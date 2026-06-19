@@ -58,7 +58,9 @@ fn full_import_pipeline() {
         "/workout-routes/route_2024-01-01.gpx".to_string(),
         workout_hash,
     );
-    let route_count = import_gpx_files(&conn, &gpx_dir, "test_import", &route_map).unwrap();
+    let offsets = std::collections::HashMap::new();
+    let route_count =
+        import_gpx_files(&conn, &gpx_dir, "test_import", &route_map, &offsets).unwrap();
     assert_eq!(route_count, 2);
 
     // Phase 4: Deduplicate

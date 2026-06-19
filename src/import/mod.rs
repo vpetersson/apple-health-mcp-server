@@ -42,6 +42,7 @@ pub fn run_import(export_dir: &Path, db_path: &Path) -> Result<()> {
         &export_dir.join("workout-routes"),
         &import_id,
         &stats.workout_route_map,
+        &stats.workout_offset_map,
     )?;
 
     // Phase 4: Deduplicate tables

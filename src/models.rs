@@ -24,6 +24,14 @@ pub struct ImportStats {
     /// importer so route points land on the same `workout_hash` value the
     /// XML importer produced for the workout.
     pub workout_route_map: HashMap<String, String>,
+    /// Maps `workout_hash` to the workout's `startDate` UTC offset in
+    /// minutes east of UTC (e.g. 540 for `+0900`, -420 for `-0700`). The
+    /// GPX importer consults this to shift true-UTC route timestamps onto
+    /// the same local-time basis the XML/ECG importers already use for
+    /// every other date column. Workouts without a parseable offset on
+    /// `startDate` are absent from the map; the GPX importer falls back to
+    /// the legacy `Z`-strip behavior in that case.
+    pub workout_offset_map: HashMap<String, i32>,
 }
 
 pub fn compute_hash(parts: &[&str]) -> String {

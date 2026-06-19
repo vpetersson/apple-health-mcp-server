@@ -24,8 +24,12 @@ fn parse_opt_f64(s: &Option<String>) -> Option<f64> {
     s.as_ref().and_then(|v| v.parse::<f64>().ok())
 }
 
-/// Strip timezone suffix like " +0000" from Apple Health date strings
-/// so DuckDB can parse them as plain TIMESTAMP (UTC assumed).
+/// Strip the trailing UTC-offset suffix (e.g. ` +0900`) from an Apple
+/// Health date string and return the naive local timestamp. Apple Health
+/// emits dates as "YYYY-MM-DD HH:MM:SS +OOOO" where the time portion is
+/// already the local wall-clock at the recording device; this helper
+/// returns the wall-clock half so it fits a DuckDB naive TIMESTAMP column.
+/// Pair with [`extract_offset_minutes`] to recover the dropped offset.
 fn clean_date(s: &str) -> String {
     // "2020-06-20 16:56:44 +0000" -> "2020-06-20 16:56:44"
     if let Some(pos) = s.rfind(" +") {
@@ -39,6 +43,29 @@ fn clean_date(s: &str) -> String {
 
 fn clean_date_opt(s: &Option<String>) -> Option<String> {
     s.as_ref().map(|v| clean_date(v))
+}
+
+/// Parse the UTC offset (minutes east of UTC) out of an Apple Health date
+/// string such as "2020-06-20 16:56:44 +0900". Returns `Some(540)` for
+/// `+0900`, `Some(-420)` for `-0700`, and `None` when the suffix is absent
+/// or malformed. The companion to [`clean_date`]: that function discards
+/// the offset to fit a naive TIMESTAMP, this one preserves it so the GPX
+/// importer can later shift true-UTC route timestamps onto the same
+/// local-time basis as everything else.
+fn extract_offset_minutes(s: &str) -> Option<i32> {
+    let (offset_str, sign) = if let Some(pos) = s.rfind(" +") {
+        (&s[pos + 2..], 1)
+    } else if let Some(pos) = s.rfind(" -") {
+        (&s[pos + 2..], -1)
+    } else {
+        return None;
+    };
+    if offset_str.len() != 4 || !offset_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = offset_str[..2].parse().ok()?;
+    let mins: i32 = offset_str[2..].parse().ok()?;
+    Some(sign * (hours * 60 + mins))
 }
 
 pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result<ImportStats> {
@@ -169,8 +196,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         let activity_type =
                             attr_value(e, b"workoutActivityType").unwrap_or_default();
                         let source_name = attr_value(e, b"sourceName").unwrap_or_default();
-                        let start_date =
-                            clean_date(&attr_value(e, b"startDate").unwrap_or_default());
+                        let start_date_raw = attr_value(e, b"startDate").unwrap_or_default();
+                        let start_date = clean_date(&start_date_raw);
+                        let start_offset_minutes = extract_offset_minutes(&start_date_raw);
                         let end_date = clean_date(&attr_value(e, b"endDate").unwrap_or_default());
                         let duration_str = attr_value(e, b"duration");
                         let duration = parse_opt_f64(&duration_str);
@@ -201,6 +229,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             creation_date: clean_date_opt(&attr_value(e, b"creationDate")),
                             start_date,
                             end_date,
+                            start_offset_minutes,
                             import_id: import_id.to_string(),
                         });
                         current_workout_events.clear();
@@ -341,6 +370,11 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                     }
                     b"Workout" => {
                         if let Some(w) = current_workout.take() {
+                            if let Some(offset) = w.start_offset_minutes {
+                                stats
+                                    .workout_offset_map
+                                    .insert(w.workout_hash.clone(), offset);
+                            }
                             workout_batch.push(w);
                             stats.workouts += 1;
 
@@ -446,6 +480,7 @@ struct WorkoutRow {
     creation_date: Option<String>,
     start_date: String,
     end_date: String,
+    start_offset_minutes: Option<i32>,
     import_id: String,
 }
 
@@ -561,6 +596,7 @@ fn flush_workouts(conn: &Connection, batch: &mut Vec<WorkoutRow>) -> Result<()> 
             w.creation_date,
             w.start_date,
             w.end_date,
+            w.start_offset_minutes,
             w.import_id,
         ])?;
     }
@@ -892,5 +928,113 @@ mod tests {
         // payload and is dropped on the floor rather than inserted with an
         // empty file_path that would silently break joins later.
         assert_eq!(stats.workout_routes, 0);
+    }
+
+    #[test]
+    fn extract_offset_minutes_parses_common_offsets() {
+        assert_eq!(
+            extract_offset_minutes("2026-06-17 04:58:38 +0900"),
+            Some(540)
+        );
+        assert_eq!(
+            extract_offset_minutes("2026-06-17 04:58:38 -0700"),
+            Some(-420)
+        );
+        assert_eq!(extract_offset_minutes("2026-06-17 04:58:38 +0000"), Some(0));
+        // Half-hour zones (e.g. India Standard Time, Nepal Standard Time).
+        assert_eq!(
+            extract_offset_minutes("2026-06-17 04:58:38 +0530"),
+            Some(330)
+        );
+        assert_eq!(
+            extract_offset_minutes("2026-06-17 04:58:38 -0345"),
+            Some(-225)
+        );
+    }
+
+    #[test]
+    fn extract_offset_minutes_rejects_missing_or_malformed() {
+        // No offset suffix at all.
+        assert_eq!(extract_offset_minutes("2026-06-17 04:58:38"), None);
+        // Too few digits.
+        assert_eq!(extract_offset_minutes("2026-06-17 04:58:38 +090"), None);
+        // Colon-separated offset (RFC 3339 form) is GPX territory, not XML.
+        // The XML helper deliberately rejects it so a stray ISO 8601 input
+        // doesn't silently parse to a wrong value.
+        assert_eq!(extract_offset_minutes("2026-06-17 04:58:38 +09:00"), None);
+        // Non-digit body.
+        assert_eq!(extract_offset_minutes("2026-06-17 04:58:38 +09ab"), None);
+    }
+
+    #[test]
+    fn import_xml_captures_workout_start_offset() {
+        // Two workouts recorded in different time zones land in the DB
+        // with their offsets preserved on `start_offset_minutes`, and the
+        // `workout_offset_map` exposes the same pair to the GPX importer.
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30" durationUnit="min" sourceName="Watch" startDate="2024-06-17 04:58:38 +0900" endDate="2024-06-17 05:28:38 +0900">
+ </Workout>
+ <Workout workoutActivityType="HKWorkoutActivityTypeCycling" duration="60" durationUnit="min" sourceName="Watch" startDate="2024-03-03 07:00:00 -0700" endDate="2024-03-03 08:00:00 -0700">
+ </Workout>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_offset").unwrap();
+        assert_eq!(stats.workouts, 2);
+        assert_eq!(stats.workout_offset_map.len(), 2);
+
+        // Offsets sorted by start_date (ascending): the PST workout is
+        // earlier in wall-clock order (after strip) than the JST workout.
+        let offsets: Vec<i32> = {
+            let mut stmt = conn
+                .prepare("SELECT start_offset_minutes FROM workouts ORDER BY start_date")
+                .unwrap();
+            let rows: Vec<i32> = stmt
+                .query_map([], |row| row.get::<_, i32>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows
+        };
+        assert_eq!(offsets, vec![-420, 540]);
+    }
+
+    #[test]
+    fn import_xml_workout_without_offset_skips_offset_map_entry() {
+        // A workout whose `startDate` lacks a TZ suffix lands in the
+        // workouts table with start_offset_minutes = NULL, and the
+        // `workout_offset_map` does NOT receive an entry for it (so the
+        // GPX importer falls back to legacy strip behavior for that
+        // workout's route).
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30" durationUnit="min" sourceName="Watch" startDate="2024-06-17 04:58:38" endDate="2024-06-17 05:28:38">
+ </Workout>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_no_offset").unwrap();
+        assert_eq!(stats.workouts, 1);
+        assert_eq!(stats.workout_offset_map.len(), 0);
+
+        let offset: Option<i32> = conn
+            .query_row("SELECT start_offset_minutes FROM workouts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(offset, None);
     }
 }
