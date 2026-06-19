@@ -21,7 +21,13 @@ fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> 
 }
 
 fn parse_opt_f64(s: &Option<String>) -> Option<f64> {
-    s.as_ref().and_then(|v| v.parse::<f64>().ok())
+    // Apple Health's own export does not emit NaN/Inf, but a third-party
+    // app contributing health data could. A single NaN row poisons every
+    // downstream AVG/SUM (DuckDB propagates NaN through aggregates), so
+    // we drop non-finite values here at parse time.
+    s.as_ref()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
 }
 
 /// Strip timezone suffix like " +0000" from Apple Health date strings
@@ -586,6 +592,17 @@ mod tests {
     #[test]
     fn parse_opt_f64_none() {
         assert_eq!(parse_opt_f64(&None), None);
+    }
+
+    #[test]
+    fn parse_opt_f64_rejects_non_finite() {
+        // Third-party HealthKit contributors have been observed to emit
+        // these. They must not reach DuckDB or every aggregate spreads NaN.
+        assert_eq!(parse_opt_f64(&Some("NaN".to_string())), None);
+        assert_eq!(parse_opt_f64(&Some("nan".to_string())), None);
+        assert_eq!(parse_opt_f64(&Some("inf".to_string())), None);
+        assert_eq!(parse_opt_f64(&Some("Infinity".to_string())), None);
+        assert_eq!(parse_opt_f64(&Some("-inf".to_string())), None);
     }
 
     #[test]
