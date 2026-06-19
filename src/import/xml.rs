@@ -57,6 +57,8 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     let mut workout_event_batch: Vec<WorkoutEventRow> = Vec::with_capacity(BATCH_SIZE);
     let mut workout_stat_batch: Vec<WorkoutStatRow> = Vec::with_capacity(BATCH_SIZE);
     let mut activity_batch: Vec<ActivityRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut correlation_batch: Vec<CorrelationRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut correlation_member_batch: Vec<CorrelationMemberRow> = Vec::with_capacity(BATCH_SIZE);
 
     // State for nested parsing
     let mut in_workout = false;
@@ -69,8 +71,11 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     let mut current_record_hash: Option<String> = None;
 
     // We skip Correlation children since the DTD says correlation member records
-    // also appear as top-level records
+    // also appear as top-level records. We still record the linkage
+    // (correlation_hash -> child record_hash) so a BP correlation's Systolic
+    // and Diastolic siblings can be retrieved together via the MCP tools.
     let mut in_correlation = false;
+    let mut current_correlation_hash: Option<String> = None;
 
     loop {
         match xml.read_event_into(&mut buf) {
@@ -258,6 +263,67 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                     b"Correlation" => {
                         in_correlation = true;
                         stats.correlations += 1;
+                        let correlation_type = attr_value(e, b"type").unwrap_or_default();
+                        let source_name = attr_value(e, b"sourceName").unwrap_or_default();
+                        let start_date =
+                            clean_date(&attr_value(e, b"startDate").unwrap_or_default());
+                        let end_date = clean_date(&attr_value(e, b"endDate").unwrap_or_default());
+                        let hash = compute_hash(&[
+                            &correlation_type,
+                            &source_name,
+                            &start_date,
+                            &end_date,
+                        ]);
+                        correlation_batch.push(CorrelationRow {
+                            correlation_hash: hash.clone(),
+                            correlation_type,
+                            source_name: Some(source_name),
+                            source_version: attr_value(e, b"sourceVersion"),
+                            device: attr_value(e, b"device"),
+                            creation_date: clean_date_opt(&attr_value(e, b"creationDate")),
+                            start_date,
+                            end_date,
+                            import_id: import_id.to_string(),
+                        });
+                        current_correlation_hash = Some(hash);
+                        if correlation_batch.len() >= BATCH_SIZE {
+                            flush_correlations(conn, &mut correlation_batch)?;
+                        }
+                    }
+                    b"Record" if in_correlation => {
+                        // The child Record's own row is taken care of by
+                        // the top-level pass (Apple Health duplicates
+                        // correlation members at the top level by spec),
+                        // so we only record the linkage here. The hash
+                        // computation must mirror the top-level Record
+                        // handler exactly so the join key matches.
+                        if let Some(ref corr_hash) = current_correlation_hash {
+                            let record_type = attr_value(e, b"type").unwrap_or_default();
+                            let source_name = attr_value(e, b"sourceName").unwrap_or_default();
+                            let start_date =
+                                clean_date(&attr_value(e, b"startDate").unwrap_or_default());
+                            let end_date =
+                                clean_date(&attr_value(e, b"endDate").unwrap_or_default());
+                            let value_str = attr_value(e, b"value");
+                            let unit = attr_value(e, b"unit");
+                            let child_hash = compute_hash(&[
+                                &record_type,
+                                &source_name,
+                                &start_date,
+                                &end_date,
+                                value_str.as_deref().unwrap_or(""),
+                                unit.as_deref().unwrap_or(""),
+                            ]);
+                            correlation_member_batch.push(CorrelationMemberRow {
+                                correlation_hash: corr_hash.clone(),
+                                record_hash: child_hash,
+                                import_id: import_id.to_string(),
+                            });
+                            stats.correlation_members += 1;
+                            if correlation_member_batch.len() >= BATCH_SIZE {
+                                flush_correlation_members(conn, &mut correlation_member_batch)?;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -298,6 +364,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                     }
                     b"Correlation" => {
                         in_correlation = false;
+                        current_correlation_hash = None;
                     }
                     _ => {}
                 }
@@ -317,10 +384,16 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     flush_workout_events(conn, &mut workout_event_batch)?;
     flush_workout_stats(conn, &mut workout_stat_batch)?;
     flush_activities(conn, &mut activity_batch)?;
+    flush_correlations(conn, &mut correlation_batch)?;
+    flush_correlation_members(conn, &mut correlation_member_batch)?;
 
     info!(
-        "XML import complete: {} records, {} workouts, {} activity summaries, {} correlations",
-        stats.records, stats.workouts, stats.activity_summaries, stats.correlations
+        "XML import complete: {} records, {} workouts, {} activity summaries, {} correlations ({} members)",
+        stats.records,
+        stats.workouts,
+        stats.activity_summaries,
+        stats.correlations,
+        stats.correlation_members,
     );
 
     Ok(stats)
@@ -384,6 +457,24 @@ struct WorkoutStatRow {
     maximum: Option<f64>,
     sum: Option<f64>,
     unit: Option<String>,
+}
+
+struct CorrelationRow {
+    correlation_hash: String,
+    correlation_type: String,
+    source_name: Option<String>,
+    source_version: Option<String>,
+    device: Option<String>,
+    creation_date: Option<String>,
+    start_date: String,
+    end_date: String,
+    import_id: String,
+}
+
+struct CorrelationMemberRow {
+    correlation_hash: String,
+    record_hash: String,
+    import_id: String,
 }
 
 struct ActivityRow {
@@ -503,6 +594,49 @@ fn flush_workout_stats(conn: &Connection, batch: &mut Vec<WorkoutStatRow>) -> Re
             s.maximum,
             s.sum,
             s.unit,
+        ])?;
+    }
+    appender.flush()?;
+    batch.clear();
+    Ok(())
+}
+
+fn flush_correlations(conn: &Connection, batch: &mut Vec<CorrelationRow>) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut appender = conn.appender("correlations")?;
+    for c in batch.iter() {
+        appender.append_row(duckdb::params![
+            c.correlation_hash,
+            c.correlation_type,
+            c.source_name,
+            c.source_version,
+            c.device,
+            c.creation_date,
+            c.start_date,
+            c.end_date,
+            c.import_id,
+        ])?;
+    }
+    appender.flush()?;
+    batch.clear();
+    Ok(())
+}
+
+fn flush_correlation_members(
+    conn: &Connection,
+    batch: &mut Vec<CorrelationMemberRow>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut appender = conn.appender("correlation_members")?;
+    for m in batch.iter() {
+        appender.append_row(duckdb::params![
+            m.correlation_hash,
+            m.record_hash,
+            m.import_id,
         ])?;
     }
     appender.flush()?;
