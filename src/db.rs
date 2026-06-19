@@ -123,6 +123,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             import_id     VARCHAR NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS heart_rate_samples (
+            parent_record_hash  VARCHAR NOT NULL,
+            sample_idx          INTEGER NOT NULL,
+            bpm                 DOUBLE,
+            sample_time         VARCHAR,
+            import_id           VARCHAR NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS imports (
             import_id    VARCHAR,
             export_dir   VARCHAR NOT NULL,
@@ -186,6 +194,13 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
             FROM route_points
         );
 
+        CREATE OR REPLACE TABLE heart_rate_samples AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (parent_record_hash, sample_idx) *
+            FROM heart_rate_samples
+            ORDER BY parent_record_hash, sample_idx, import_id DESC
+        );
+
         CREATE OR REPLACE TABLE imports AS
         SELECT * FROM (
             SELECT DISTINCT ON (import_id) *
@@ -197,6 +212,7 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_records_source ON records(source_name);
         CREATE INDEX IF NOT EXISTS idx_workouts_type_date ON workouts(activity_type, start_date);
         CREATE INDEX IF NOT EXISTS idx_route_points_workout ON route_points(workout_hash);
+        CREATE INDEX IF NOT EXISTS idx_heart_rate_samples_parent ON heart_rate_samples(parent_record_hash);
         ",
     )?;
 
@@ -252,8 +268,9 @@ mod tests {
             )
             .unwrap();
         // records, record_metadata, workouts, workout_events, workout_statistics,
-        // activity_summaries, ecg_readings, ecg_samples, route_points, imports = 10
-        assert_eq!(count, 10);
+        // activity_summaries, ecg_readings, ecg_samples, route_points,
+        // heart_rate_samples, imports = 11
+        assert_eq!(count, 11);
     }
 
     #[test]
@@ -267,7 +284,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 11);
     }
 
     #[test]
