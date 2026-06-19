@@ -228,7 +228,7 @@ impl HealthServer {
     }
 
     #[tool(
-        description = "Get full workout details by workout_hash. Returns: workout object (all fields), events (lap/pause markers), statistics (per-metric breakdowns like heart rate zones), and has_route boolean. Get the workout_hash from list_workouts."
+        description = "Get full workout details by workout_hash. Returns: workout object (all fields, with total_distance / total_energy_burned backfilled from workout_statistics for iOS 11+ exports), events (lap/pause markers), statistics (per-metric breakdowns like heart rate zones), metadata array of {key, value} (HKIndoorWorkout, HKAverageMETs, HKWeather*, app-specific keys), route object (file_path, source_name, source_version, creation_date, start_date, end_date, point_count) or null when the workout has no GPS track, and has_route boolean. Get the workout_hash from list_workouts."
     )]
     async fn get_workout_details(&self, params: Parameters<GetWorkoutDetailsParams>) -> String {
         let Parameters(params) = params;
@@ -258,19 +258,64 @@ impl HealthServer {
             Err(e) => return format!("Error: {}", e),
         };
 
-        let has_route = match self.query_to_json(
-            "SELECT COUNT(*) as count FROM route_points WHERE workout_hash = ?",
+        let metadata = match self.query_to_json(
+            "SELECT key, value FROM workout_metadata WHERE workout_hash = ? ORDER BY key",
             &[&hash as &dyn duckdb::ToSql],
         ) {
             Ok(r) => r,
             Err(e) => return format!("Error: {}", e),
         };
 
+        // The route join uses point_count to keep the response single-row
+        // even when multiple route_points rows exist. LEFT JOIN keeps a
+        // route row visible when the GPX file was empty, and we still
+        // surface that the workout claimed a route by returning the
+        // workout_routes row with point_count = 0.
+        let route_rows = match self.query_to_json(
+            "SELECT wr.file_path, wr.source_name, wr.source_version, \
+                    wr.creation_date, wr.start_date, wr.end_date, \
+                    (SELECT COUNT(*) FROM route_points rp \
+                       WHERE rp.workout_hash = wr.workout_hash) AS point_count \
+             FROM workout_routes wr \
+             WHERE wr.workout_hash = ?",
+            &[&hash as &dyn duckdb::ToSql],
+        ) {
+            Ok(r) => r,
+            Err(e) => return format!("Error: {}", e),
+        };
+        let route_obj = route_rows
+            .as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        // has_route stays true when either the workout_routes row exists
+        // (XML claimed a GPX file) or route_points has rows (GPX import
+        // succeeded). This lets clients distinguish "route promised but
+        // GPX file missing" from "no route at all".
+        let route_point_count = match self.query_to_json(
+            "SELECT COUNT(*) AS count FROM route_points WHERE workout_hash = ?",
+            &[&hash as &dyn duckdb::ToSql],
+        ) {
+            Ok(r) => r,
+            Err(e) => return format!("Error: {}", e),
+        };
+        let has_route = !route_obj.is_null()
+            || route_point_count
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|r| r.get("count"))
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0)
+                > 0;
+
         let result = json!({
             "workout": workout.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
             "events": events,
             "statistics": statistics,
-            "has_route": has_route.as_array().and_then(|a| a.first()).and_then(|r| r.get("count")).and_then(|c| c.as_i64()).unwrap_or(0) > 0,
+            "metadata": metadata,
+            "route": route_obj,
+            "has_route": has_route,
         });
 
         serde_json::to_string_pretty(&result).unwrap_or_default()
@@ -504,6 +549,9 @@ mod tests {
             INSERT INTO ecg_samples VALUES ('ecg1', 2, -50.0);
             INSERT INTO route_points VALUES ('rp1', 'wh1', 37.7749, -122.4194, 10.5, '2024-01-01 10:00:00', 3.5, 180.0, 5.0, 3.0, 'imp1');
             INSERT INTO route_points VALUES ('rp2', 'wh1', 37.7750, -122.4195, 11.0, '2024-01-01 10:00:05', 3.6, 181.0, 4.5, 2.8, 'imp1');
+            INSERT INTO workout_metadata VALUES ('wh1', 'HKIndoorWorkout', '0', 'imp1');
+            INSERT INTO workout_metadata VALUES ('wh1', 'HKAverageMETs', '7.2 kcal/hr·kg', 'imp1');
+            INSERT INTO workout_routes VALUES ('wh1', '/workout-routes/route_2024-01-01.gpx', 'Apple Watch', '10.0', '2024-01-01 10:30:00', '2024-01-01 10:00:00', '2024-01-01 10:30:00', 'imp1');
             INSERT INTO imports VALUES ('imp1', '/tmp/export', '2024-01-01 00:00:00', 3, 1, 5.0);
             ",
         )
@@ -707,6 +755,26 @@ mod tests {
         assert!(parsed.get("events").unwrap().is_array());
         assert!(parsed.get("statistics").unwrap().is_array());
         assert_eq!(parsed.get("has_route").unwrap(), &Value::Bool(true));
+
+        // Metadata array surfaces the workout-level MetadataEntry rows
+        // that the importer now persists into workout_metadata.
+        let metadata = parsed.get("metadata").unwrap().as_array().unwrap();
+        assert_eq!(metadata.len(), 2);
+        let keys: Vec<&str> = metadata
+            .iter()
+            .map(|m| m.get("key").unwrap().as_str().unwrap())
+            .collect();
+        assert!(keys.contains(&"HKIndoorWorkout"));
+        assert!(keys.contains(&"HKAverageMETs"));
+
+        // Route object exposes the workout_routes row joined with the
+        // route_points count so clients can size their next call.
+        let route = parsed.get("route").unwrap().as_object().unwrap();
+        assert_eq!(
+            route.get("file_path").unwrap().as_str().unwrap(),
+            "/workout-routes/route_2024-01-01.gpx"
+        );
+        assert_eq!(route.get("point_count").unwrap().as_i64().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -985,5 +1053,14 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("workout").unwrap().is_null());
         assert_eq!(parsed.get("has_route").unwrap(), &Value::Bool(false));
+        // Missing workouts surface as empty metadata and null route so
+        // clients can rely on a stable response shape.
+        assert!(parsed
+            .get("metadata")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(parsed.get("route").unwrap().is_null());
     }
 }
