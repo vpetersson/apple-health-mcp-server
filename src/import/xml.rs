@@ -57,6 +57,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     let mut workout_event_batch: Vec<WorkoutEventRow> = Vec::with_capacity(BATCH_SIZE);
     let mut workout_stat_batch: Vec<WorkoutStatRow> = Vec::with_capacity(BATCH_SIZE);
     let mut activity_batch: Vec<ActivityRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut heart_rate_sample_batch: Vec<HeartRateSampleRow> = Vec::with_capacity(BATCH_SIZE);
 
     // State for nested parsing
     let mut in_workout = false;
@@ -67,6 +68,12 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
 
     let mut in_record = false;
     let mut current_record_hash: Option<String> = None;
+    // sample_idx is reset per Record. HR records carry their
+    // InstantaneousBeatsPerMinute children directly; HRV records carry
+    // them inside <HeartRateVariabilityMetadataList>. Both flatten into
+    // the heart_rate_samples table keyed by the parent record hash.
+    let mut current_hr_sample_idx: i32 = 0;
+    let mut in_hrv_metadata_list = false;
 
     // We skip Correlation children since the DTD says correlation member records
     // also appear as top-level records
@@ -117,6 +124,8 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         // Check if this is a self-closing element or has children
                         in_record = true;
                         current_record_hash = Some(hash);
+                        current_hr_sample_idx = 0;
+                        in_hrv_metadata_list = false;
 
                         if record_batch.len() >= BATCH_SIZE {
                             flush_records(conn, &mut record_batch)?;
@@ -218,6 +227,39 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                     b"FileReference" if in_workout => {
                         _current_workout_route_file = attr_value(e, b"path");
                     }
+                    b"InstantaneousBeatsPerMinute" => {
+                        // Emitted as a child of either an HR Record (a
+                        // window's average bpm record carries the per-beat
+                        // detail) or an HRV Record wrapped in a
+                        // HeartRateVariabilityMetadataList element. Both
+                        // cases share the same parent record hash, so we
+                        // key the sample by that hash and an incrementing
+                        // per-record sample_idx.
+                        if let Some(ref parent_hash) = current_record_hash {
+                            let bpm = parse_opt_f64(&attr_value(e, b"bpm"));
+                            let sample_time = attr_value(e, b"time");
+                            heart_rate_sample_batch.push(HeartRateSampleRow {
+                                parent_record_hash: parent_hash.clone(),
+                                sample_idx: current_hr_sample_idx,
+                                bpm,
+                                sample_time,
+                                import_id: import_id.to_string(),
+                            });
+                            current_hr_sample_idx += 1;
+                            stats.heart_rate_samples += 1;
+                            if heart_rate_sample_batch.len() >= BATCH_SIZE {
+                                flush_heart_rate_samples(conn, &mut heart_rate_sample_batch)?;
+                            }
+                        }
+                    }
+                    b"HeartRateVariabilityMetadataList" => {
+                        // Acts purely as a structural marker around the
+                        // HRV beat list. The InstantaneousBeatsPerMinute
+                        // handler above already keys on
+                        // current_record_hash, so this flag exists for
+                        // future use and to make the intent visible.
+                        in_hrv_metadata_list = true;
+                    }
                     b"ActivitySummary" => {
                         let date_comp = attr_value(e, b"dateComponents").unwrap_or_default();
                         activity_batch.push(ActivityRow {
@@ -299,6 +341,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                     b"Correlation" => {
                         in_correlation = false;
                     }
+                    b"HeartRateVariabilityMetadataList" => {
+                        in_hrv_metadata_list = false;
+                    }
                     _ => {}
                 }
             }
@@ -317,11 +362,21 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
     flush_workout_events(conn, &mut workout_event_batch)?;
     flush_workout_stats(conn, &mut workout_stat_batch)?;
     flush_activities(conn, &mut activity_batch)?;
+    flush_heart_rate_samples(conn, &mut heart_rate_sample_batch)?;
 
     info!(
-        "XML import complete: {} records, {} workouts, {} activity summaries, {} correlations",
-        stats.records, stats.workouts, stats.activity_summaries, stats.correlations
+        "XML import complete: {} records, {} workouts, {} activity summaries, {} correlations, {} heart-rate samples",
+        stats.records,
+        stats.workouts,
+        stats.activity_summaries,
+        stats.correlations,
+        stats.heart_rate_samples,
     );
+
+    // in_hrv_metadata_list is written but not currently consumed outside
+    // the scanner loop; suppress the dead-read warning so the flag stays
+    // available for future diagnostics without a clippy fight.
+    let _ = in_hrv_metadata_list;
 
     Ok(stats)
 }
@@ -384,6 +439,14 @@ struct WorkoutStatRow {
     maximum: Option<f64>,
     sum: Option<f64>,
     unit: Option<String>,
+}
+
+struct HeartRateSampleRow {
+    parent_record_hash: String,
+    sample_idx: i32,
+    bpm: Option<f64>,
+    sample_time: Option<String>,
+    import_id: String,
 }
 
 struct ActivityRow {
@@ -503,6 +566,25 @@ fn flush_workout_stats(conn: &Connection, batch: &mut Vec<WorkoutStatRow>) -> Re
             s.maximum,
             s.sum,
             s.unit,
+        ])?;
+    }
+    appender.flush()?;
+    batch.clear();
+    Ok(())
+}
+
+fn flush_heart_rate_samples(conn: &Connection, batch: &mut Vec<HeartRateSampleRow>) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut appender = conn.appender("heart_rate_samples")?;
+    for s in batch.iter() {
+        appender.append_row(duckdb::params![
+            s.parent_record_hash,
+            s.sample_idx,
+            s.bpm,
+            s.sample_time,
+            s.import_id,
         ])?;
     }
     appender.flush()?;
@@ -642,5 +724,100 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM record_metadata", [], |row| row.get(0))
             .unwrap();
         assert_eq!(meta_count, 1);
+    }
+
+    #[test]
+    fn import_xml_instantaneous_bpm_under_hr_record() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="Apple Watch" unit="count/min" value="68" startDate="2024-02-02 08:00:00 +0000" endDate="2024-02-02 08:00:30 +0000">
+  <MetadataEntry key="HKMetadataKeyHeartRateMotionContext" value="1"/>
+  <InstantaneousBeatsPerMinute bpm="66" time="08:00:00.000"/>
+  <InstantaneousBeatsPerMinute bpm="68" time="08:00:10.000"/>
+  <InstantaneousBeatsPerMinute bpm="70" time="08:00:20.000"/>
+ </Record>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_hr").unwrap();
+        assert_eq!(stats.records, 1);
+        // record_metadata still counts MotionContext, but heart-rate
+        // samples land in their own table.
+        assert_eq!(stats.metadata_entries, 1);
+        assert_eq!(stats.heart_rate_samples, 3);
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM heart_rate_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 3);
+
+        // sample_idx is reset per Record and starts at 0.
+        let (min_idx, max_idx): (i32, i32) = conn
+            .query_row(
+                "SELECT MIN(sample_idx), MAX(sample_idx) FROM heart_rate_samples",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(min_idx, 0);
+        assert_eq!(max_idx, 2);
+    }
+
+    #[test]
+    fn import_xml_hrv_metadata_list_samples() {
+        let conn = open_db_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <Record type="HKQuantityTypeIdentifierHeartRateVariabilitySDNN" sourceName="Apple Watch" unit="ms" value="42.5" startDate="2024-03-03 09:00:00 +0000" endDate="2024-03-03 09:01:00 +0000">
+  <MetadataEntry key="HKMetadataKeyHeartRateMotionContext" value="0"/>
+  <HeartRateVariabilityMetadataList>
+   <InstantaneousBeatsPerMinute bpm="60" time="09:00:00.000"/>
+   <InstantaneousBeatsPerMinute bpm="62" time="09:00:15.000"/>
+   <InstantaneousBeatsPerMinute bpm="58" time="09:00:30.000"/>
+   <InstantaneousBeatsPerMinute bpm="61" time="09:00:45.000"/>
+  </HeartRateVariabilityMetadataList>
+ </Record>
+</HealthData>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("export.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let stats = import_xml(&conn, &xml_path, "test_hrv").unwrap();
+        assert_eq!(stats.records, 1);
+        // The four samples nested inside HeartRateVariabilityMetadataList
+        // must land in heart_rate_samples under the HRV record's hash.
+        assert_eq!(stats.heart_rate_samples, 4);
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM heart_rate_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 4);
+
+        // Confirm the parent_record_hash matches the HRV record's hash,
+        // not some placeholder, so a downstream join on records works.
+        let (sample_parent, record_hash): (String, String) = conn
+            .query_row(
+                "SELECT hrs.parent_record_hash, r.record_hash
+                 FROM heart_rate_samples hrs
+                 JOIN records r ON r.record_hash = hrs.parent_record_hash
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sample_parent, record_hash);
     }
 }
