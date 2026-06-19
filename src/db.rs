@@ -123,6 +123,24 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             import_id     VARCHAR NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS workout_metadata (
+            workout_hash    VARCHAR NOT NULL,
+            key             VARCHAR NOT NULL,
+            value           VARCHAR,
+            import_id       VARCHAR NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS workout_routes (
+            workout_hash    VARCHAR NOT NULL,
+            file_path       VARCHAR NOT NULL,
+            source_name     VARCHAR,
+            source_version  VARCHAR,
+            creation_date   TIMESTAMP,
+            start_date      TIMESTAMP,
+            end_date        TIMESTAMP,
+            import_id       VARCHAR NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS imports (
             import_id    VARCHAR,
             export_dir   VARCHAR NOT NULL,
@@ -186,6 +204,20 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
             FROM route_points
         );
 
+        CREATE OR REPLACE TABLE workout_metadata AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (workout_hash, key) *
+            FROM workout_metadata
+            ORDER BY workout_hash, key, import_id DESC
+        );
+
+        CREATE OR REPLACE TABLE workout_routes AS
+        SELECT * FROM (
+            SELECT DISTINCT ON (workout_hash, file_path) *
+            FROM workout_routes
+            ORDER BY workout_hash, file_path, import_id DESC
+        );
+
         CREATE OR REPLACE TABLE imports AS
         SELECT * FROM (
             SELECT DISTINCT ON (import_id) *
@@ -197,10 +229,73 @@ pub fn deduplicate_tables(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_records_source ON records(source_name);
         CREATE INDEX IF NOT EXISTS idx_workouts_type_date ON workouts(activity_type, start_date);
         CREATE INDEX IF NOT EXISTS idx_route_points_workout ON route_points(workout_hash);
+        CREATE INDEX IF NOT EXISTS idx_workout_metadata_hash ON workout_metadata(workout_hash);
+        CREATE INDEX IF NOT EXISTS idx_workout_routes_hash ON workout_routes(workout_hash);
         ",
     )?;
 
     info!("Deduplication complete");
+    Ok(())
+}
+
+/// Populate `workouts.total_distance` / `total_energy_burned` and the matching
+/// unit columns from `workout_statistics`. Apple Health stopped emitting these
+/// values as `<Workout>` attributes in iOS 11 and moved them into
+/// `<WorkoutStatistics>` children, leaving the legacy `workouts` columns as
+/// vestigial NULL on every row. Aggregating the statistics back into those
+/// columns lets existing tooling that queries `workouts` directly keep working
+/// without having to learn the statistics table.
+pub fn populate_workout_vestigial_columns(conn: &Connection) -> Result<()> {
+    info!("Populating workouts.total_distance / total_energy_burned from workout_statistics...");
+
+    // Aggregate active energy burned. Multiple statistics rows for the same
+    // workout (rare, but allowed) are summed; the unit is taken from any one of
+    // them (units should be consistent within a single workout).
+    conn.execute_batch(
+        "
+        UPDATE workouts AS w
+        SET total_energy_burned = agg.total_sum,
+            total_energy_unit   = COALESCE(w.total_energy_unit, agg.unit)
+        FROM (
+            SELECT
+                workout_hash,
+                SUM(sum)  AS total_sum,
+                MIN(unit) AS unit
+            FROM workout_statistics
+            WHERE stat_type = 'HKQuantityTypeIdentifierActiveEnergyBurned'
+              AND sum IS NOT NULL
+            GROUP BY workout_hash
+        ) AS agg
+        WHERE w.workout_hash = agg.workout_hash
+          AND w.total_energy_burned IS NULL;
+        ",
+    )?;
+
+    // Aggregate distance across every distance-flavored quantity type. The
+    // statistics table only carries one distance type per workout in practice
+    // (the type matching the activity), so SUM is effectively a passthrough
+    // while still tolerating multi-row stats.
+    conn.execute_batch(
+        "
+        UPDATE workouts AS w
+        SET total_distance      = agg.total_sum,
+            total_distance_unit = COALESCE(w.total_distance_unit, agg.unit)
+        FROM (
+            SELECT
+                workout_hash,
+                SUM(sum)  AS total_sum,
+                MIN(unit) AS unit
+            FROM workout_statistics
+            WHERE stat_type LIKE 'HKQuantityTypeIdentifierDistance%'
+              AND sum IS NOT NULL
+            GROUP BY workout_hash
+        ) AS agg
+        WHERE w.workout_hash = agg.workout_hash
+          AND w.total_distance IS NULL;
+        ",
+    )?;
+
+    info!("Vestigial column population complete");
     Ok(())
 }
 
@@ -252,8 +347,9 @@ mod tests {
             )
             .unwrap();
         // records, record_metadata, workouts, workout_events, workout_statistics,
-        // activity_summaries, ecg_readings, ecg_samples, route_points, imports = 10
-        assert_eq!(count, 10);
+        // activity_summaries, ecg_readings, ecg_samples, route_points,
+        // workout_metadata, workout_routes, imports = 12
+        assert_eq!(count, 12);
     }
 
     #[test]
@@ -267,7 +363,107 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 12);
+    }
+
+    #[test]
+    fn populate_workout_vestigial_columns_aggregates_energy_and_distance() {
+        let conn = setup();
+        conn.execute_batch(
+            "
+            -- Two workouts: one running, one cycling
+            INSERT INTO workouts VALUES
+              ('wh_run', 'HKWorkoutActivityTypeRunning', 1800, 's',
+               NULL, NULL, NULL, NULL,
+               'Watch', '11', 'iPhone', '2024-01-01 06:00:00',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00', 'imp1'),
+              ('wh_cyc', 'HKWorkoutActivityTypeCycling', 3600, 's',
+               NULL, NULL, NULL, NULL,
+               'Watch', '11', 'iPhone', '2024-01-01 07:00:00',
+               '2024-01-01 07:00:00', '2024-01-01 08:00:00', 'imp1');
+
+            INSERT INTO workout_statistics VALUES
+              ('wh_run', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00',
+               NULL, NULL, NULL, 240.5, 'kcal'),
+              ('wh_run', 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00',
+               NULL, NULL, NULL, 3.2, 'km'),
+              ('wh_cyc', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2024-01-01 07:00:00', '2024-01-01 08:00:00',
+               NULL, NULL, NULL, 480.0, 'kcal'),
+              ('wh_cyc', 'HKQuantityTypeIdentifierDistanceCycling',
+               '2024-01-01 07:00:00', '2024-01-01 08:00:00',
+               NULL, NULL, NULL, 18.0, 'km');
+            ",
+        )
+        .unwrap();
+
+        populate_workout_vestigial_columns(&conn).unwrap();
+
+        let (energy, energy_unit, distance, distance_unit): (f64, String, f64, String) = conn
+            .query_row(
+                "SELECT total_energy_burned, total_energy_unit,
+                        total_distance, total_distance_unit
+                 FROM workouts WHERE workout_hash = 'wh_run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!((energy - 240.5).abs() < 1e-6);
+        assert_eq!(energy_unit, "kcal");
+        assert!((distance - 3.2).abs() < 1e-6);
+        assert_eq!(distance_unit, "km");
+
+        let (energy_cyc, distance_cyc): (f64, f64) = conn
+            .query_row(
+                "SELECT total_energy_burned, total_distance
+                 FROM workouts WHERE workout_hash = 'wh_cyc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!((energy_cyc - 480.0).abs() < 1e-6);
+        assert!((distance_cyc - 18.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn populate_workout_vestigial_columns_leaves_existing_values_alone() {
+        let conn = setup();
+        conn.execute_batch(
+            "
+            INSERT INTO workouts VALUES
+              ('wh_legacy', 'HKWorkoutActivityTypeRunning', 1800, 's',
+               5.0, 'mi', 300.0, 'kcal',
+               'Watch', '10', 'iPhone', '2020-01-01 06:00:00',
+               '2020-01-01 06:00:00', '2020-01-01 06:30:00', 'imp1');
+
+            INSERT INTO workout_statistics VALUES
+              ('wh_legacy', 'HKQuantityTypeIdentifierActiveEnergyBurned',
+               '2020-01-01 06:00:00', '2020-01-01 06:30:00',
+               NULL, NULL, NULL, 999.0, 'kcal'),
+              ('wh_legacy', 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+               '2020-01-01 06:00:00', '2020-01-01 06:30:00',
+               NULL, NULL, NULL, 99.0, 'km');
+            ",
+        )
+        .unwrap();
+
+        populate_workout_vestigial_columns(&conn).unwrap();
+
+        let (energy, distance, distance_unit): (f64, f64, String) = conn
+            .query_row(
+                "SELECT total_energy_burned, total_distance, total_distance_unit
+                 FROM workouts WHERE workout_hash = 'wh_legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // Pre-iOS-11 exports already carry the values on the Workout element;
+        // statistics-derived aggregates must not overwrite them.
+        assert!((energy - 300.0).abs() < 1e-6);
+        assert!((distance - 5.0).abs() < 1e-6);
+        assert_eq!(distance_unit, "mi");
     }
 
     #[test]
