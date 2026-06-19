@@ -1,7 +1,8 @@
 pub mod tools;
 
 use anyhow::Result;
-use duckdb::types::ValueRef;
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime};
+use duckdb::types::{TimeUnit, ValueRef};
 use duckdb::Connection;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -13,6 +14,49 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tools::*;
+
+/// Convert a duckdb `TimeUnit` and integer value into a nanosecond count.
+/// Returns `None` on overflow so the caller can fall back to JSON `null`.
+fn duckdb_unit_to_nanos(unit: TimeUnit, value: i64) -> Option<i64> {
+    match unit {
+        TimeUnit::Second => value.checked_mul(1_000_000_000),
+        TimeUnit::Millisecond => value.checked_mul(1_000_000),
+        TimeUnit::Microsecond => value.checked_mul(1_000),
+        TimeUnit::Nanosecond => Some(value),
+    }
+}
+
+/// Format a duckdb TIMESTAMP value (always treated as UTC, matching the
+/// importer which strips the `+0000` suffix from Apple Health dates before
+/// inserting). Produces `YYYY-MM-DD HH:MM:SS` so the response shape matches
+/// the strings the importer originally fed in.
+fn format_duckdb_timestamp(unit: TimeUnit, value: i64) -> Option<String> {
+    let nanos = duckdb_unit_to_nanos(unit, value)?;
+    let secs = nanos.div_euclid(1_000_000_000);
+    let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+    DateTime::from_timestamp(secs, subsec_nanos)
+        .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+/// Format a duckdb DATE column (days since 1970-01-01) as `YYYY-MM-DD`.
+fn format_duckdb_date32(days_since_epoch: i32) -> Option<String> {
+    NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|epoch| epoch.checked_add_signed(Duration::days(days_since_epoch as i64)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+}
+
+/// Format a duckdb TIME column (offset within a day at the given resolution)
+/// as `HH:MM:SS`. Out-of-range values fall through to JSON `null`.
+fn format_duckdb_time64(unit: TimeUnit, value: i64) -> Option<String> {
+    let nanos_in_day = duckdb_unit_to_nanos(unit, value)?;
+    let secs_in_day = nanos_in_day.div_euclid(1_000_000_000);
+    let subsec_nanos = nanos_in_day.rem_euclid(1_000_000_000) as u32;
+    if !(0..86_400).contains(&secs_in_day) {
+        return None;
+    }
+    NaiveTime::from_num_seconds_from_midnight_opt(secs_in_day as u32, subsec_nanos)
+        .map(|t| t.format("%H:%M:%S").to_string())
+}
 
 #[derive(Clone)]
 pub struct HealthServer {
@@ -95,15 +139,46 @@ impl HealthServer {
                         Ok(ValueRef::Text(bytes)) => {
                             Value::String(String::from_utf8_lossy(bytes).into_owned())
                         }
-                        Ok(_) => {
-                            // Timestamp, Date32, Time64, Decimal, Interval, etc.
-                            // Fall back to string via DuckDB's own formatting
-                            match row.get::<_, String>(i) {
-                                Ok(s) => Value::String(s),
-                                Err(_) => continue,
+                        // TIMESTAMP / DATE / TIME come back from duckdb as
+                        // integer counters rather than strings: TIMESTAMP is
+                        // a count of (unit) since the unix epoch in UTC,
+                        // DATE is days since 1970-01-01, TIME is an offset
+                        // within a day. The duckdb crate does not implement
+                        // `Row::get::<_, String>` for these, so the previous
+                        // generic stringification path always returned Err
+                        // and clients saw `null` (or, on older revisions,
+                        // a vanished key) for every date column. Convert
+                        // them through chrono here so callers can read e.g.
+                        // `start_date` as `"2024-01-01 08:00:00"`.
+                        Ok(ValueRef::Timestamp(unit, value)) => {
+                            match format_duckdb_timestamp(unit, value) {
+                                Some(s) => Value::String(s),
+                                None => Value::Null,
                             }
                         }
-                        Err(_) => continue,
+                        Ok(ValueRef::Date32(days)) => match format_duckdb_date32(days) {
+                            Some(s) => Value::String(s),
+                            None => Value::Null,
+                        },
+                        Ok(ValueRef::Time64(unit, value)) => {
+                            match format_duckdb_time64(unit, value) {
+                                Some(s) => Value::String(s),
+                                None => Value::Null,
+                            }
+                        }
+                        Ok(_) => {
+                            // Decimal, Interval, list/struct types, etc.
+                            // Fall back to duckdb's own stringification, and
+                            // to JSON `null` if even that fails — the
+                            // important thing is that the response shape
+                            // stays stable: the column always appears as
+                            // either a string or `null`, never absent.
+                            match row.get::<_, String>(i) {
+                                Ok(s) => Value::String(s),
+                                Err(_) => Value::Null,
+                            }
+                        }
+                        Err(_) => Value::Null,
                     };
                     map.insert(name, val);
                 }
@@ -607,9 +682,13 @@ mod tests {
     }
 
     #[test]
-    fn query_to_json_timestamp_raw() {
-        // Raw timestamps may be skipped if the DuckDB driver can't convert them to String.
-        // This tests that the query still succeeds even with timestamp columns.
+    fn query_to_json_timestamp_returns_iso_string() {
+        // Bare TIMESTAMP columns used to hit the catch-all branch that
+        // tried Row::get::<_, String>, which is not implemented for
+        // TIMESTAMP by the duckdb crate; that produced JSON null for
+        // every date column on every tool response. With the explicit
+        // ValueRef::Timestamp arm in place the value comes back as a
+        // human-readable ISO string clients (LLMs) can compare.
         let server = setup_server();
         let result = server
             .query_to_json(
@@ -619,6 +698,35 @@ mod tests {
             .unwrap();
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
+        let s = arr[0]
+            .get("start_date")
+            .expect("start_date column must be present")
+            .as_str()
+            .expect("TIMESTAMP must be JSON string, not null");
+        assert_eq!(s, "2024-01-01 08:00:00");
+    }
+
+    #[test]
+    fn query_to_json_timestamp_literal_returns_string() {
+        let server = setup_server();
+        let result = server
+            .query_to_json("SELECT TIMESTAMP '2025-03-14 09:26:53' AS ts", &[])
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(
+            arr[0].get("ts").unwrap().as_str().unwrap(),
+            "2025-03-14 09:26:53"
+        );
+    }
+
+    #[test]
+    fn query_to_json_time_literal_returns_string() {
+        let server = setup_server();
+        let result = server
+            .query_to_json("SELECT TIME '13:45:07' AS t", &[])
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr[0].get("t").unwrap().as_str().unwrap(), "13:45:07");
     }
 
     #[test]
@@ -884,14 +992,17 @@ mod tests {
     }
 
     #[test]
-    fn query_to_json_date_type() {
+    fn query_to_json_date_returns_iso_string() {
         let server = setup_server();
-        // DATE type goes through the catch-all branch
+        // DATE used to hit the catch-all branch and surface as JSON null;
+        // it must now come back as a YYYY-MM-DD string so callers can
+        // group rows on date values without a second round trip.
         let result = server
             .query_to_json("SELECT DATE '2024-01-15' AS d", &[])
             .unwrap();
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("d").unwrap().as_str().unwrap(), "2024-01-15");
     }
 
     #[tokio::test]
