@@ -6,7 +6,10 @@ use anyhow::Result;
 use std::path::Path;
 use tracing::info;
 
-use crate::db::{deduplicate_tables, ensure_schema, open_db, rebuild_daily_stats};
+use crate::db::{
+    deduplicate_tables, ensure_schema, open_db, populate_workout_vestigial_columns,
+    rebuild_daily_stats,
+};
 
 pub fn run_import(export_dir: &Path, db_path: &Path) -> Result<()> {
     let start = std::time::Instant::now();
@@ -45,8 +48,15 @@ pub fn run_import(export_dir: &Path, db_path: &Path) -> Result<()> {
     info!("Phase 4: Deduplicating tables...");
     deduplicate_tables(&conn)?;
 
-    // Phase 5: Rebuild aggregation tables
-    info!("Phase 5: Building daily statistics...");
+    // Phase 5: Backfill workouts.total_distance / total_energy_burned from
+    // workout_statistics. Must run after deduplication so the SUM over the
+    // statistics table sees one row per (workout_hash, stat_type) instead
+    // of the duplicate set that bulk-loading produced.
+    info!("Phase 5: Backfilling vestigial workout columns from statistics...");
+    populate_workout_vestigial_columns(&conn)?;
+
+    // Phase 6: Rebuild aggregation tables
+    info!("Phase 6: Building daily statistics...");
     rebuild_daily_stats(&conn)?;
 
     // Phase 6: Log import metadata
