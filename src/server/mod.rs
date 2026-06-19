@@ -61,8 +61,13 @@ impl HealthServer {
                         .column_name(i)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|_| format!("col{}", i));
+                    // NULL and unconvertible types both become JSON `null`
+                    // instead of dropping the column entirely. The latter
+                    // produced unstable response shapes — the same tool
+                    // would return a different key set depending on which
+                    // rows happened to have NULL or non-stringifiable types.
                     let val = match row.get_ref(i) {
-                        Ok(ValueRef::Null) => continue,
+                        Ok(ValueRef::Null) => Value::Null,
                         Ok(ValueRef::Boolean(b)) => Value::Bool(b),
                         Ok(ValueRef::TinyInt(n)) => Value::Number(n.into()),
                         Ok(ValueRef::SmallInt(n)) => Value::Number(n.into()),
@@ -97,13 +102,18 @@ impl HealthServer {
                         }
                         Ok(_) => {
                             // Timestamp, Date32, Time64, Decimal, Interval, etc.
-                            // Fall back to string via DuckDB's own formatting
+                            // Fall back to string via DuckDB's own formatting,
+                            // and to JSON `null` if even that conversion fails.
+                            // The duckdb crate does not implement `get::<_, String>`
+                            // for every value type, so unsupported types reach
+                            // the Err arm here and would otherwise vanish from
+                            // the response object.
                             match row.get::<_, String>(i) {
                                 Ok(s) => Value::String(s),
-                                Err(_) => continue,
+                                Err(_) => Value::Null,
                             }
                         }
-                        Err(_) => continue,
+                        Err(_) => Value::Null,
                     };
                     map.insert(name, val);
                 }
@@ -535,15 +545,39 @@ mod tests {
     }
 
     #[test]
-    fn query_to_json_null_skipped() {
+    fn query_to_json_null_is_json_null() {
+        // NULL columns used to be dropped from the JSON row entirely, which
+        // gave the same tool an unstable response shape across rows. They
+        // now serialize as JSON `null` so consumers (LLMs in particular)
+        // can rely on a fixed key set per query.
         let server = setup_server();
         let result = server
             .query_to_json("SELECT device FROM records WHERE record_hash = 'rh1'", &[])
             .unwrap();
         let arr = result.as_array().unwrap();
         let obj = arr[0].as_object().unwrap();
-        // device is NULL, so the key should not be present
-        assert!(!obj.contains_key("device"));
+        assert!(obj.contains_key("device"));
+        assert_eq!(obj["device"], Value::Null);
+    }
+
+    #[test]
+    fn query_to_json_date_column_round_trips() {
+        // Regression for the silent column-drop seen on DATE values: any
+        // expression that yields a non-Text, non-stringifiable type would
+        // hit the `Ok(_)` fallback's `Err(_) => continue` and disappear
+        // from the response. The arm now lands on `Value::Null` so the
+        // key stays in the object.
+        let server = setup_server();
+        let result = server
+            .query_to_json(
+                "SELECT CAST(start_date AS DATE) + INTERVAL 1 DAY AS night_of \
+                 FROM records WHERE record_hash = 'rh1'",
+                &[],
+            )
+            .unwrap();
+        let arr = result.as_array().unwrap();
+        let obj = arr[0].as_object().unwrap();
+        assert!(obj.contains_key("night_of"));
     }
 
     #[test]
