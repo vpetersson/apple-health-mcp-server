@@ -539,7 +539,7 @@ mod tests {
             INSERT INTO records VALUES ('rh2', 'HKQuantityTypeIdentifierHeartRate', 80.0, 'count/min', 'Apple Watch', '10.0', NULL, '2024-01-01 09:00:00', '2024-01-01 09:00:00', '2024-01-01 09:01:00', 'imp1');
             INSERT INTO records VALUES ('rh3', 'HKQuantityTypeIdentifierStepCount', 1500.0, 'count', 'iPhone', '17.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 23:59:59', 'imp1');
             INSERT INTO record_metadata VALUES ('rh1', 'HKMetadataKeyHeartRateMotionContext', '1');
-            INSERT INTO workouts VALUES ('wh1', 'HKWorkoutActivityTypeRunning', 1800.0, 'sec', 5000.0, 'm', 300.0, 'kcal', 'Apple Watch', '10.0', NULL, '2024-01-01 10:00:00', '2024-01-01 10:00:00', '2024-01-01 10:30:00', 'imp1');
+            INSERT INTO workouts VALUES ('wh1', 'HKWorkoutActivityTypeRunning', 1800.0, 'sec', 5000.0, 'm', 300.0, 'kcal', 'Apple Watch', '10.0', NULL, '2024-01-01 10:00:00', '2024-01-01 10:00:00', '2024-01-01 10:30:00', NULL, 'imp1');
             INSERT INTO workout_events VALUES ('wh1', 'HKWorkoutEventTypeLap', '2024-01-01 10:15:00', NULL, NULL);
             INSERT INTO workout_statistics VALUES ('wh1', 'HKQuantityTypeIdentifierHeartRate', '2024-01-01 10:00:00', '2024-01-01 10:30:00', 150.0, 120.0, 180.0, NULL, 'count/min');
             INSERT INTO activity_summaries VALUES ('2024-01-01', 500.0, 600.0, 45.0, 30.0, 30.0, 30.0, 10.0, 12.0, 'imp1');

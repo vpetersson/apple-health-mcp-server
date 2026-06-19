@@ -56,6 +56,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             creation_date        TIMESTAMP,
             start_date           TIMESTAMP NOT NULL,
             end_date             TIMESTAMP NOT NULL,
+            -- Minutes east of UTC parsed from the workout's `startDate`
+            -- attribute (e.g. 540 for `+0900`, -420 for `-0700`). The XML
+            -- importer strips the offset before storing `start_date`,
+            -- leaving a naive TIMESTAMP that holds local wall-clock time.
+            -- This column preserves the original offset so the GPX importer
+            -- can shift true-UTC route timestamps onto the same local-time
+            -- basis as the rest of the data.
+            start_offset_minutes INTEGER,
             import_id            VARCHAR NOT NULL
         );
 
@@ -398,11 +406,11 @@ mod tests {
               ('wh_run', 'HKWorkoutActivityTypeRunning', 1800, 's',
                NULL, NULL, NULL, NULL,
                'Watch', '11', 'iPhone', '2024-01-01 06:00:00',
-               '2024-01-01 06:00:00', '2024-01-01 06:30:00', 'imp1'),
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00', NULL, 'imp1'),
               ('wh_cyc', 'HKWorkoutActivityTypeCycling', 3600, 's',
                NULL, NULL, NULL, NULL,
                'Watch', '11', 'iPhone', '2024-01-01 07:00:00',
-               '2024-01-01 07:00:00', '2024-01-01 08:00:00', 'imp1');
+               '2024-01-01 07:00:00', '2024-01-01 08:00:00', NULL, 'imp1');
 
             INSERT INTO workout_statistics VALUES
               ('wh_run', 'HKQuantityTypeIdentifierActiveEnergyBurned',
@@ -458,7 +466,7 @@ mod tests {
               ('wh_legacy', 'HKWorkoutActivityTypeRunning', 1800, 's',
                5.0, 'mi', 300.0, 'kcal',
                'Watch', '10', 'iPhone', '2020-01-01 06:00:00',
-               '2020-01-01 06:00:00', '2020-01-01 06:30:00', 'imp1');
+               '2020-01-01 06:00:00', '2020-01-01 06:30:00', NULL, 'imp1');
 
             INSERT INTO workout_statistics VALUES
               ('wh_legacy', 'HKQuantityTypeIdentifierActiveEnergyBurned',
@@ -616,7 +624,7 @@ mod tests {
               ('wh_run', 'HKWorkoutActivityTypeRunning', 1800, 's',
                NULL, NULL, NULL, NULL,
                'Watch', '11', 'iPhone', '2024-01-01 06:00:00',
-               '2024-01-01 06:00:00', '2024-01-01 06:30:00', 'imp1');
+               '2024-01-01 06:00:00', '2024-01-01 06:30:00', NULL, 'imp1');
 
             INSERT INTO workout_statistics VALUES
               ('wh_run', 'HKQuantityTypeIdentifierActiveEnergyBurned',
