@@ -89,6 +89,12 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         let value_str = attr_value(e, b"value");
                         let unit = attr_value(e, b"unit");
                         let value = parse_opt_f64(&value_str);
+                        // Preserve categorical / non-numeric values (e.g. sleep stages
+                        // like HKCategoryValueSleepAnalysisAsleepDeep) that don't parse as f64.
+                        let text_value = match (&value, &value_str) {
+                            (None, Some(s)) if !s.is_empty() => Some(s.clone()),
+                            _ => None,
+                        };
 
                         let hash = compute_hash(&[
                             &record_type,
@@ -103,6 +109,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             record_hash: hash.clone(),
                             record_type,
                             value,
+                            text_value,
                             unit,
                             source_name,
                             source_version: attr_value(e, b"sourceVersion"),
@@ -332,6 +339,7 @@ struct RecordRow {
     record_hash: String,
     record_type: String,
     value: Option<f64>,
+    text_value: Option<String>,
     unit: Option<String>,
     source_name: String,
     source_version: Option<String>,
@@ -411,6 +419,7 @@ fn flush_records(conn: &Connection, batch: &mut Vec<RecordRow>) -> Result<()> {
             r.record_hash,
             r.record_type,
             r.value,
+            r.text_value,
             r.unit,
             r.source_name,
             r.source_version,
