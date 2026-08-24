@@ -16,7 +16,7 @@ path = "src/main.rs"
 rmcp = { version = "0.16", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 duckdb = { version = "1", features = ["bundled"] }
-quick-xml = "0.37"
+quick-xml = "0.41"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
