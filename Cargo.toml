@@ -13,7 +13,7 @@ name = "apple-health-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "0.16", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 duckdb = { version = "1", features = ["bundled"] }
 quick-xml = "0.37"
