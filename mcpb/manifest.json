@@ -4,7 +4,7 @@
   "display_name": "Apple Health",
   "version": "26.9.0",
   "description": "Query your Apple Health export — records, workouts, GPS routes and ECGs — from a local DuckDB database.",
-  "long_description": "Imports an Apple Health export into DuckDB and exposes it over MCP. Every tool is read-only and runs entirely on your machine: nothing is uploaded, and the bundled server only ever opens the database file you point it at.\n\nBefore installing, run `apple-health-mcp import --export-dir /path/to/apple_health_export --db ~/health.duckdb` once to build the database, then select that file as the Health database below.",
+  "long_description": "Imports an Apple Health export into DuckDB and exposes it over MCP. Every tool is read-only and runs entirely on your machine: nothing is uploaded, and the bundled server only ever opens the database file you point it at.\n\nBefore installing, run `apple-health-mcp import --export-dir /path/to/apple_health_export` once to build the database. It lands in ~/.config/apple-health-mcp/health.duckdb, which is prefilled below.\n\nYou can re-import later while Claude still has this extension loaded — the server holds the database open only for the length of each query.",
   "author": {
     "name": "Viktor Petersson",
     "url": "https://github.com/vpetersson"
@@ -17,7 +17,14 @@
     "url": "https://github.com/vpetersson/apple-health-mcp-server"
   },
   "license": "MIT",
-  "keywords": ["apple health", "healthkit", "fitness", "workouts", "ecg", "duckdb"],
+  "keywords": [
+    "apple health",
+    "healthkit",
+    "fitness",
+    "workouts",
+    "ecg",
+    "duckdb"
+  ],
   "server": {
     "type": "binary",
     "entry_point": "server/apple-health-mcp",
@@ -39,8 +46,9 @@
     "database_path": {
       "type": "file",
       "title": "Health database",
-      "description": "The health.duckdb file produced by `apple-health-mcp import`",
-      "required": true
+      "description": "The health.duckdb file produced by `apple-health-mcp import` (the default import location is prefilled below)",
+      "required": true,
+      "default": "${HOME}/.config/apple-health-mcp/health.duckdb"
     }
   },
   "tools": [
@@ -95,7 +103,10 @@
   ],
   "compatibility": {
     "claude_desktop": ">=0.10.0",
-    "platforms": ["darwin", "linux"]
+    "platforms": [
+      "darwin",
+      "linux"
+    ]
   },
   "privacy_policies": []
 }

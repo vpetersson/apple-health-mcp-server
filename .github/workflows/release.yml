@@ -104,3 +104,36 @@ jobs:
           else
             gh release upload "${GITHUB_REF_NAME}" release/* --clobber --repo "${GITHUB_REPOSITORY}"
           fi
+
+  formula:
+    name: Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FORMULA: Formula/apple-health-mcp.rb
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download checksums
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --pattern SHA256SUMS --dir dist --repo "${GITHUB_REPOSITORY}"
+      - name: Render Homebrew formula
+        run: scripts/update-formula.sh "${GITHUB_REF_NAME}" dist/SHA256SUMS
+      - name: Commit Homebrew formula
+        run: |
+          branch="$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)"
+          # Committing through the contents API keeps the commit signed by
+          # GitHub instead of landing unsigned from the runner.
+          args=(
+            -f "message=Update Homebrew formula for ${GITHUB_REF_NAME}"
+            -f "branch=${branch}"
+            -f "content=$(base64 -w0 "$FORMULA")"
+          )
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${FORMULA}?ref=${branch}" --jq .sha 2>/dev/null || true)"
+          if [ -n "$sha" ]; then
+            args+=(-f "sha=${sha}")
+          fi
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${FORMULA}" "${args[@]}"

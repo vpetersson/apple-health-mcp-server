@@ -27,9 +27,11 @@ cargo run -- serve --db ./health.duckdb --port 8080 --host 127.0.0.1
 
 The MCP endpoint is at `http://<host>:<port>/mcp`.
 
+`--db` is optional on both subcommands; see `src/paths.rs` for how it is resolved.
+
 ## Versioning
 
-CalVer, `YY.MM.MICRO` (`26.9.0` = first release of September 2026). Months are not zero-padded — Cargo requires a valid SemVer string and SemVer rejects leading zeros. To cut a release: bump `version` in `Cargo.toml`, refresh `Cargo.lock` with `cargo update -p apple-health-mcp`, merge to `master`, then push a `vYY.MM.MICRO` tag. The tag triggers `.github/workflows/release.yml`, which builds the Linux and macOS binaries, packages each as a `.mcpb` bundle, and creates the GitHub release. `mcpb/manifest.json` does **not** need bumping — `scripts/build-mcpb.sh` injects the version from `Cargo.toml` at pack time.
+CalVer, `YY.MM.MICRO` (`26.9.0` = first release of September 2026). Months are not zero-padded — Cargo requires a valid SemVer string and SemVer rejects leading zeros. To cut a release: bump `version` in `Cargo.toml`, refresh `Cargo.lock` with `cargo update -p apple-health-mcp`, merge to `master`, then push a `vYY.MM.MICRO` tag. The tag triggers `.github/workflows/release.yml`, which builds the Linux and macOS binaries, packages each as a `.mcpb` bundle, creates the GitHub release, and regenerates the Homebrew formula. `mcpb/manifest.json` does **not** need bumping — `scripts/build-mcpb.sh` injects the version from `Cargo.toml` at pack time.
 
 ## Desktop distribution
 
@@ -38,6 +40,8 @@ Claude Desktop installs local MCP servers as MCP bundles (`.mcpb`), not hand-wri
 ## Architecture
 
 **CLI** (`src/main.rs`): Two subcommands via clap — `import` and `serve`.
+
+**Paths** (`src/paths.rs`): Resolves the default database location — `$APPLE_HEALTH_MCP_DB`, then an existing `./health.duckdb` in the working directory (the pre-`~/.config` location), then `~/.config/apple-health-mcp/health.duckdb`. `PathEnv` captures the environment explicitly so resolution is testable without mutating process state.
 
 **Import pipeline** (`src/import/`): Multi-phase process orchestrated by `import::run_import`:
 1. `xml.rs` — Streams `export.xml` with quick-xml, bulk-loads records, workouts, activity summaries, workout events/statistics, and record metadata using DuckDB's Appender API. Batches rows (100k) before flushing. Skips Correlation children (they appear as top-level records).
@@ -60,3 +64,4 @@ Claude Desktop installs local MCP servers as MCP bundles (`.mcpb`), not hand-wri
 - **Never hold the database open**: DuckDB locks the file for as long as *any* connection is open, read-only included, and refuses a read-write open from another process while that lock is held. A long-lived connection therefore blocks `apple-health-mcp import` for the whole session — and the Claude Desktop bundle keeps a session open permanently. `server::Database::File` reopens per query (~3 ms even on a 400 MB database) so the file is unlocked between calls; `Database::Memory` keeps its connection because there is no file and nothing to reopen from. The cross-process behaviour is only reproducible by running the binary twice — DuckDB's lock is per-process — so the regression guard is `tests/test_concurrent_access.rs`, which drives the real server over stdio while a real import runs.
 - **Lock-aware errors**: `db::open_db` (read-write) waits out a reader that is mid-query before giving up, and `server::unavailable` turns DuckDB's lock message into "an import is probably running" rather than passing raw IO-error text to the model. `db::is_lock_conflict` matches on the message because DuckDB has no distinct error code for it.
 - **Router wiring**: `#[tool_handler(router = self.tool_router)]` — the macro's default (`Self::tool_router()`) rebuilds the router on every request and leaves the struct field unread.
+- **Release & Homebrew**: the `formula` job in `.github/workflows/release.yml` runs after the release is published, renders `Formula/apple-health-mcp.rb` from `scripts/formula.rb.tmpl` via `scripts/update-formula.sh` using the release's `SHA256SUMS`, and commits it through the contents API (so the commit is signed by GitHub). The formula is generated, never hand-edited; CI renders it from a synthetic release and checks it parses. The repository doubles as its own Homebrew tap, and the release assets are bare binaries named `apple-health-mcp-<tag>-<target>`, so the formula stages a single file rather than unpacking an archive. Non-official taps require explicit trust since Homebrew 6.0.0 — install instructions must use the fully qualified formula name or `brew trust`.
