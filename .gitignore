@@ -1,3 +1,9 @@
 /target
 *.duckdb
 *.duckdb.wal
+
+# MCP bundles built by scripts/build-mcpb.sh
+dist/
+*.mcpb
+bun.lock
+node_modules/

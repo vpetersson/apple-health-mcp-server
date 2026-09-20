@@ -131,3 +131,41 @@ fn server_queries_all_tables() {
         assert!(cnt >= 1, "Table {} should have data", table);
     }
 }
+
+/// Regression guard: DuckDB refuses to convert TIMESTAMP columns to `String`,
+/// so an unhandled temporal variant drops every date from every tool response.
+#[test]
+fn imported_dates_survive_into_tool_output() {
+    let conn = open_db_in_memory().unwrap();
+    ensure_schema(&conn).unwrap();
+    let xml_dir = tempfile::tempdir().unwrap();
+    std::fs::write(xml_dir.path().join("export.xml"), common::MINIMAL_XML).unwrap();
+    import_xml(&conn, &xml_dir.path().join("export.xml"), "test").unwrap();
+    rebuild_daily_stats(&conn).unwrap();
+
+    let server = HealthServer::new_in_memory(conn);
+    let result = server
+        .query_to_json(
+            "SELECT start_date, end_date FROM records ORDER BY start_date",
+            &[],
+        )
+        .unwrap();
+    let rows = result.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let start = row
+            .get("start_date")
+            .unwrap_or_else(|| panic!("start_date missing from {row}"));
+        assert!(start.as_str().unwrap().starts_with("2024-01-01"), "{start}");
+        assert!(row.get("end_date").is_some(), "end_date missing from {row}");
+    }
+
+    // The daily stats table stores DATE, not TIMESTAMP — a separate ValueRef variant.
+    let stats = server
+        .query_to_json("SELECT date FROM daily_record_stats LIMIT 1", &[])
+        .unwrap();
+    assert_eq!(
+        stats.as_array().unwrap()[0].get("date").unwrap(),
+        "2024-01-01"
+    );
+}

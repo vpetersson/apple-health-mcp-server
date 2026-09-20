@@ -1,0 +1,101 @@
+{
+  "manifest_version": "0.3",
+  "name": "apple-health-mcp",
+  "display_name": "Apple Health",
+  "version": "26.9.0",
+  "description": "Query your Apple Health export — records, workouts, GPS routes and ECGs — from a local DuckDB database.",
+  "long_description": "Imports an Apple Health export into DuckDB and exposes it over MCP. Every tool is read-only and runs entirely on your machine: nothing is uploaded, and the bundled server only ever opens the database file you point it at.\n\nBefore installing, run `apple-health-mcp import --export-dir /path/to/apple_health_export --db ~/health.duckdb` once to build the database, then select that file as the Health database below.",
+  "author": {
+    "name": "Viktor Petersson",
+    "url": "https://github.com/vpetersson"
+  },
+  "homepage": "https://github.com/vpetersson/apple-health-mcp-server",
+  "documentation": "https://github.com/vpetersson/apple-health-mcp-server#readme",
+  "support": "https://github.com/vpetersson/apple-health-mcp-server/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vpetersson/apple-health-mcp-server"
+  },
+  "license": "MIT",
+  "keywords": ["apple health", "healthkit", "fitness", "workouts", "ecg", "duckdb"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/apple-health-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/apple-health-mcp",
+      "args": [
+        "serve",
+        "--transport",
+        "stdio",
+        "--db",
+        "${user_config.database_path}"
+      ],
+      "env": {
+        "RUST_LOG": "warn"
+      }
+    }
+  },
+  "user_config": {
+    "database_path": {
+      "type": "file",
+      "title": "Health database",
+      "description": "The health.duckdb file produced by `apple-health-mcp import`",
+      "required": true
+    }
+  },
+  "tools": [
+    {
+      "name": "list_record_types",
+      "description": "List all health record types with counts and date ranges"
+    },
+    {
+      "name": "query_records",
+      "description": "Query records by type, date range, and source"
+    },
+    {
+      "name": "get_record_statistics",
+      "description": "Aggregated stats (avg/min/max/sum) by day, week, month, or year"
+    },
+    {
+      "name": "list_workouts",
+      "description": "List workouts with optional filtering"
+    },
+    {
+      "name": "get_workout_details",
+      "description": "Full workout details including events, statistics, and route availability"
+    },
+    {
+      "name": "get_workout_route",
+      "description": "GPS route data for a workout"
+    },
+    {
+      "name": "get_activity_summaries",
+      "description": "Daily activity ring data (energy, exercise, stand hours with goals)"
+    },
+    {
+      "name": "list_ecg_readings",
+      "description": "List ECG recordings with dates and classifications"
+    },
+    {
+      "name": "get_ecg_data",
+      "description": "Full ECG waveform with voltage samples"
+    },
+    {
+      "name": "list_data_sources",
+      "description": "Devices and apps that contributed data"
+    },
+    {
+      "name": "get_import_history",
+      "description": "History of data imports"
+    },
+    {
+      "name": "run_custom_query",
+      "description": "Run arbitrary read-only SQL (SELECT/WITH) against the database"
+    }
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "linux"]
+  },
+  "privacy_policies": []
+}
