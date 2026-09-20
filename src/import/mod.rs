@@ -97,10 +97,10 @@ fn build_workout_route_map(
     let mut in_workout = false;
     let mut current_workout_hash: Option<String> = None;
 
-    fn attr_val(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
+    fn attr_val(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
         e.attributes().filter_map(|a| a.ok()).find_map(|a| {
             if a.key.as_ref() == name {
-                String::from_utf8(a.value.to_vec()).ok()
+                Some(a.value.to_string())
             } else {
                 None
             }
@@ -111,15 +111,15 @@ fn build_workout_route_map(
         match xml.read_event_into(&mut buf) {
             Ok(Event::Eof) => break,
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let local = e.name().as_ref().to_vec();
-                match local.as_slice() {
-                    b"Workout" => {
+                let local = e.name().as_ref().to_string();
+                match local.as_str() {
+                    "Workout" => {
                         in_workout = true;
-                        let activity_type = attr_val(e, b"workoutActivityType").unwrap_or_default();
-                        let source_name = attr_val(e, b"sourceName").unwrap_or_default();
-                        let start_date = attr_val(e, b"startDate").unwrap_or_default();
-                        let end_date = attr_val(e, b"endDate").unwrap_or_default();
-                        let duration_str = attr_val(e, b"duration");
+                        let activity_type = attr_val(e, "workoutActivityType").unwrap_or_default();
+                        let source_name = attr_val(e, "sourceName").unwrap_or_default();
+                        let start_date = attr_val(e, "startDate").unwrap_or_default();
+                        let end_date = attr_val(e, "endDate").unwrap_or_default();
+                        let duration_str = attr_val(e, "duration");
 
                         let hash = crate::models::compute_hash(&[
                             &activity_type,
@@ -130,9 +130,9 @@ fn build_workout_route_map(
                         ]);
                         current_workout_hash = Some(hash);
                     }
-                    b"FileReference" if in_workout => {
+                    "FileReference" if in_workout => {
                         if let (Some(ref wh), Some(path)) =
-                            (&current_workout_hash, attr_val(e, b"path"))
+                            (&current_workout_hash, attr_val(e, "path"))
                         {
                             map.insert(path, wh.clone());
                         }
@@ -141,7 +141,7 @@ fn build_workout_route_map(
                 }
             }
             Ok(Event::End(ref e)) => {
-                if e.name().as_ref() == b"Workout" {
+                if e.name().as_ref() == "Workout" {
                     in_workout = false;
                     current_workout_hash = None;
                 }

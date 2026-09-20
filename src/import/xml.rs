@@ -10,10 +10,10 @@ use crate::models::{compute_hash, ImportStats};
 
 const BATCH_SIZE: usize = 100_000;
 
-fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
+fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     e.attributes().filter_map(|a| a.ok()).find_map(|a| {
         if a.key.as_ref() == name {
-            String::from_utf8(a.value.to_vec()).ok()
+            Some(a.value.to_string())
         } else {
             None
         }
@@ -80,14 +80,14 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                 let local = name.as_ref();
 
                 match local {
-                    b"Record" if !in_correlation => {
-                        let record_type = attr_value(e, b"type").unwrap_or_default();
-                        let source_name = attr_value(e, b"sourceName").unwrap_or_default();
+                    "Record" if !in_correlation => {
+                        let record_type = attr_value(e, "type").unwrap_or_default();
+                        let source_name = attr_value(e, "sourceName").unwrap_or_default();
                         let start_date =
-                            clean_date(&attr_value(e, b"startDate").unwrap_or_default());
-                        let end_date = clean_date(&attr_value(e, b"endDate").unwrap_or_default());
-                        let value_str = attr_value(e, b"value");
-                        let unit = attr_value(e, b"unit");
+                            clean_date(&attr_value(e, "startDate").unwrap_or_default());
+                        let end_date = clean_date(&attr_value(e, "endDate").unwrap_or_default());
+                        let value_str = attr_value(e, "value");
+                        let unit = attr_value(e, "unit");
                         let value = parse_opt_f64(&value_str);
 
                         let hash = compute_hash(&[
@@ -105,9 +105,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             value,
                             unit,
                             source_name,
-                            source_version: attr_value(e, b"sourceVersion"),
-                            device: attr_value(e, b"device"),
-                            creation_date: clean_date_opt(&attr_value(e, b"creationDate")),
+                            source_version: attr_value(e, "sourceVersion"),
+                            device: attr_value(e, "device"),
+                            creation_date: clean_date_opt(&attr_value(e, "creationDate")),
                             start_date,
                             end_date,
                             import_id: import_id.to_string(),
@@ -126,9 +126,9 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             info!("Processed {} records...", stats.records);
                         }
                     }
-                    b"MetadataEntry" => {
-                        let key = attr_value(e, b"key").unwrap_or_default();
-                        let value = attr_value(e, b"value").unwrap_or_default();
+                    "MetadataEntry" => {
+                        let key = attr_value(e, "key").unwrap_or_default();
+                        let value = attr_value(e, "value").unwrap_or_default();
 
                         if in_workout {
                             // Skip workout metadata for now (could store if needed)
@@ -146,15 +146,15 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             }
                         }
                     }
-                    b"Workout" => {
+                    "Workout" => {
                         in_workout = true;
                         let activity_type =
-                            attr_value(e, b"workoutActivityType").unwrap_or_default();
-                        let source_name = attr_value(e, b"sourceName").unwrap_or_default();
+                            attr_value(e, "workoutActivityType").unwrap_or_default();
+                        let source_name = attr_value(e, "sourceName").unwrap_or_default();
                         let start_date =
-                            clean_date(&attr_value(e, b"startDate").unwrap_or_default());
-                        let end_date = clean_date(&attr_value(e, b"endDate").unwrap_or_default());
-                        let duration_str = attr_value(e, b"duration");
+                            clean_date(&attr_value(e, "startDate").unwrap_or_default());
+                        let end_date = clean_date(&attr_value(e, "endDate").unwrap_or_default());
+                        let duration_str = attr_value(e, "duration");
                         let duration = parse_opt_f64(&duration_str);
 
                         let hash = compute_hash(&[
@@ -169,18 +169,15 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             workout_hash: hash,
                             activity_type,
                             duration,
-                            duration_unit: attr_value(e, b"durationUnit"),
-                            total_distance: parse_opt_f64(&attr_value(e, b"totalDistance")),
-                            total_distance_unit: attr_value(e, b"totalDistanceUnit"),
-                            total_energy_burned: parse_opt_f64(&attr_value(
-                                e,
-                                b"totalEnergyBurned",
-                            )),
-                            total_energy_unit: attr_value(e, b"totalEnergyBurnedUnit"),
+                            duration_unit: attr_value(e, "durationUnit"),
+                            total_distance: parse_opt_f64(&attr_value(e, "totalDistance")),
+                            total_distance_unit: attr_value(e, "totalDistanceUnit"),
+                            total_energy_burned: parse_opt_f64(&attr_value(e, "totalEnergyBurned")),
+                            total_energy_unit: attr_value(e, "totalEnergyBurnedUnit"),
                             source_name,
-                            source_version: attr_value(e, b"sourceVersion"),
-                            device: attr_value(e, b"device"),
-                            creation_date: clean_date_opt(&attr_value(e, b"creationDate")),
+                            source_version: attr_value(e, "sourceVersion"),
+                            device: attr_value(e, "device"),
+                            creation_date: clean_date_opt(&attr_value(e, "creationDate")),
                             start_date,
                             end_date,
                             import_id: import_id.to_string(),
@@ -189,64 +186,61 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         current_workout_stats.clear();
                         _current_workout_route_file = None;
                     }
-                    b"WorkoutEvent" if in_workout => {
+                    "WorkoutEvent" if in_workout => {
                         if let Some(ref w) = current_workout {
                             current_workout_events.push(WorkoutEventRow {
                                 workout_hash: w.workout_hash.clone(),
-                                event_type: attr_value(e, b"type").unwrap_or_default(),
-                                date: clean_date_opt(&attr_value(e, b"date")),
-                                duration: parse_opt_f64(&attr_value(e, b"duration")),
-                                duration_unit: attr_value(e, b"durationUnit"),
+                                event_type: attr_value(e, "type").unwrap_or_default(),
+                                date: clean_date_opt(&attr_value(e, "date")),
+                                duration: parse_opt_f64(&attr_value(e, "duration")),
+                                duration_unit: attr_value(e, "durationUnit"),
                             });
                         }
                     }
-                    b"WorkoutStatistics" if in_workout => {
+                    "WorkoutStatistics" if in_workout => {
                         if let Some(ref w) = current_workout {
                             current_workout_stats.push(WorkoutStatRow {
                                 workout_hash: w.workout_hash.clone(),
-                                stat_type: attr_value(e, b"type").unwrap_or_default(),
-                                start_date: clean_date_opt(&attr_value(e, b"startDate")),
-                                end_date: clean_date_opt(&attr_value(e, b"endDate")),
-                                average: parse_opt_f64(&attr_value(e, b"average")),
-                                minimum: parse_opt_f64(&attr_value(e, b"minimum")),
-                                maximum: parse_opt_f64(&attr_value(e, b"maximum")),
-                                sum: parse_opt_f64(&attr_value(e, b"sum")),
-                                unit: attr_value(e, b"unit"),
+                                stat_type: attr_value(e, "type").unwrap_or_default(),
+                                start_date: clean_date_opt(&attr_value(e, "startDate")),
+                                end_date: clean_date_opt(&attr_value(e, "endDate")),
+                                average: parse_opt_f64(&attr_value(e, "average")),
+                                minimum: parse_opt_f64(&attr_value(e, "minimum")),
+                                maximum: parse_opt_f64(&attr_value(e, "maximum")),
+                                sum: parse_opt_f64(&attr_value(e, "sum")),
+                                unit: attr_value(e, "unit"),
                             });
                         }
                     }
-                    b"FileReference" if in_workout => {
-                        _current_workout_route_file = attr_value(e, b"path");
+                    "FileReference" if in_workout => {
+                        _current_workout_route_file = attr_value(e, "path");
                     }
-                    b"ActivitySummary" => {
-                        let date_comp = attr_value(e, b"dateComponents").unwrap_or_default();
+                    "ActivitySummary" => {
+                        let date_comp = attr_value(e, "dateComponents").unwrap_or_default();
                         activity_batch.push(ActivityRow {
                             date_components: date_comp,
                             active_energy_burned: parse_opt_f64(&attr_value(
                                 e,
-                                b"activeEnergyBurned",
+                                "activeEnergyBurned",
                             )),
                             active_energy_burned_goal: parse_opt_f64(&attr_value(
                                 e,
-                                b"activeEnergyBurnedGoal",
+                                "activeEnergyBurnedGoal",
                             )),
-                            apple_move_time: parse_opt_f64(&attr_value(e, b"appleMoveTime")),
+                            apple_move_time: parse_opt_f64(&attr_value(e, "appleMoveTime")),
                             apple_move_time_goal: parse_opt_f64(&attr_value(
                                 e,
-                                b"appleMoveTimeGoal",
+                                "appleMoveTimeGoal",
                             )),
-                            apple_exercise_time: parse_opt_f64(&attr_value(
-                                e,
-                                b"appleExerciseTime",
-                            )),
+                            apple_exercise_time: parse_opt_f64(&attr_value(e, "appleExerciseTime")),
                             apple_exercise_time_goal: parse_opt_f64(&attr_value(
                                 e,
-                                b"appleExerciseTimeGoal",
+                                "appleExerciseTimeGoal",
                             )),
-                            apple_stand_hours: parse_opt_f64(&attr_value(e, b"appleStandHours")),
+                            apple_stand_hours: parse_opt_f64(&attr_value(e, "appleStandHours")),
                             apple_stand_hours_goal: parse_opt_f64(&attr_value(
                                 e,
-                                b"appleStandHoursGoal",
+                                "appleStandHoursGoal",
                             )),
                             import_id: import_id.to_string(),
                         });
@@ -255,7 +249,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                             flush_activities(conn, &mut activity_batch)?;
                         }
                     }
-                    b"Correlation" => {
+                    "Correlation" => {
                         in_correlation = true;
                         stats.correlations += 1;
                     }
@@ -266,11 +260,11 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                 let name = e.name();
                 let local = name.as_ref();
                 match local {
-                    b"Record" => {
+                    "Record" => {
                         in_record = false;
                         current_record_hash = None;
                     }
-                    b"Workout" => {
+                    "Workout" => {
                         if let Some(w) = current_workout.take() {
                             workout_batch.push(w);
                             stats.workouts += 1;
@@ -296,7 +290,7 @@ pub fn import_xml(conn: &Connection, xml_path: &Path, import_id: &str) -> Result
                         }
                         in_workout = false;
                     }
-                    b"Correlation" => {
+                    "Correlation" => {
                         in_correlation = false;
                     }
                     _ => {}

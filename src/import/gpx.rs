@@ -54,10 +54,10 @@ pub fn import_gpx_files(
     Ok(total_points)
 }
 
-fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
+fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     e.attributes().filter_map(|a| a.ok()).find_map(|a| {
         if a.key.as_ref() == name {
-            String::from_utf8(a.value.to_vec()).ok()
+            Some(a.value.to_string())
         } else {
             None
         }
@@ -97,10 +97,10 @@ pub(crate) fn import_single_gpx(
             Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"trkpt" => {
+                    "trkpt" => {
                         in_trkpt = true;
-                        lat = attr_value(e, b"lat").and_then(|v| v.parse().ok());
-                        lon = attr_value(e, b"lon").and_then(|v| v.parse().ok());
+                        lat = attr_value(e, "lat").and_then(|v| v.parse().ok());
+                        lon = attr_value(e, "lon").and_then(|v| v.parse().ok());
                         ele = None;
                         timestamp = None;
                         speed = None;
@@ -108,15 +108,17 @@ pub(crate) fn import_single_gpx(
                         h_accuracy = None;
                         v_accuracy = None;
                     }
-                    b"ele" | b"time" | b"speed" | b"course" | b"hAcc" | b"vAcc" if in_trkpt => {
-                        current_tag = Some(String::from_utf8_lossy(local.as_ref()).to_string());
+                    "ele" | "time" | "speed" | "course" | "hAcc" | "vAcc" if in_trkpt => {
+                        current_tag = Some(local.as_ref().to_string());
                     }
                     _ => {}
                 }
             }
             Ok(Event::Text(ref t)) if in_trkpt => {
                 if let Some(ref tag) = current_tag {
-                    let text = t.unescape().unwrap_or_default().to_string();
+                    let text = quick_xml::escape::unescape(t)
+                        .unwrap_or_default()
+                        .to_string();
                     match tag.as_str() {
                         "ele" => ele = text.parse().ok(),
                         "time" => timestamp = Some(text),
@@ -130,7 +132,7 @@ pub(crate) fn import_single_gpx(
             }
             Ok(Event::End(ref e)) => {
                 let local = e.local_name();
-                if local.as_ref() == b"trkpt" && in_trkpt {
+                if local.as_ref() == "trkpt" && in_trkpt {
                     if let (Some(lat_v), Some(lon_v), Some(ref ts)) = (lat, lon, &timestamp) {
                         let wh = workout_hash.unwrap_or("");
                         let point_hash =
@@ -285,6 +287,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(wh, "workout_hash_1");
+
+        // The elevation/speed/course/accuracy fields all come from text nodes
+        // rather than attributes, so assert them explicitly: a regression there
+        // leaves the row count intact and silently nulls the columns.
+        let (ele, speed, course, h_acc, v_acc): (f64, f64, f64, f64, f64) = conn
+            .query_row(
+                "SELECT elevation, speed, course, h_accuracy, v_accuracy \
+                 FROM route_points ORDER BY timestamp LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(ele, 10.5);
+        assert_eq!(speed, 3.5);
+        assert_eq!(course, 180.0);
+        assert_eq!(h_acc, 5.0);
+        assert_eq!(v_acc, 3.0);
     }
 
     #[test]
