@@ -67,41 +67,122 @@ fn time64_to_string(unit: TimeUnit, value: i64) -> Option<String> {
         .map(|t| t.format("%H:%M:%S%.f").to_string())
 }
 
+/// Where the server reads health data from.
+enum Database {
+    /// A database file, reopened for each query and closed again straight away.
+    ///
+    /// DuckDB locks the file for as long as *any* connection is open, read-only
+    /// included, and refuses a read-write open from another process while that
+    /// lock is held. Holding one connection for the lifetime of the session
+    /// would therefore block `apple-health-mcp import` for as long as the
+    /// client stayed connected — which, now that the server is installed as a
+    /// Claude Desktop bundle, is all the time. Reopening costs a few
+    /// milliseconds even on a multi-gigabyte database, so the file sits
+    /// unlocked between queries and an import can take the write lock.
+    ///
+    /// Reopening also means a finished import is picked up on the next query,
+    /// with no need to restart the client.
+    File(PathBuf),
+    /// An owned in-memory database: nothing to lock, and no file to reopen
+    /// from, so the connection is kept for the lifetime of the server.
+    Memory(Mutex<Connection>),
+}
+
+/// Why a read against the database did not produce rows.
+enum DbError {
+    /// The database could not be opened at all — most often because an import
+    /// holds the write lock. Nothing is wrong with the query.
+    Unavailable(String),
+    /// The database opened but the query itself failed.
+    Query(String),
+}
+
+/// Explain a failed read-only open in terms the caller can act on.
+fn unavailable(err: anyhow::Error) -> DbError {
+    DbError::Unavailable(if crate::db::is_lock_conflict(&err) {
+        "The health database is locked by another process. An import is probably running — \
+         try again once it finishes."
+            .to_string()
+    } else {
+        format!("Cannot open the health database: {err}")
+    })
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbError::Unavailable(message) => f.write_str(message),
+            DbError::Query(message) => f.write_str(message),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HealthServer {
-    db_path: PathBuf,
-    conn: Arc<Mutex<Connection>>,
+    db: Arc<Database>,
     tool_router: ToolRouter<Self>,
 }
 
 impl std::fmt::Debug for HealthServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db_path: &dyn std::fmt::Debug = match self.db.as_ref() {
+            Database::File(path) => path,
+            Database::Memory(_) => &":memory:",
+        };
         f.debug_struct("HealthServer")
-            .field("db_path", &self.db_path)
+            .field("db_path", db_path)
             .finish()
     }
 }
 
 impl HealthServer {
     pub fn new(db_path: &Path) -> Result<Self> {
-        let conn = crate::db::open_db_readonly(db_path)?;
+        // Open once so a missing or unreadable database fails at startup
+        // rather than on the first tool call, then let it go again.
+        drop(crate::db::open_db_readonly(db_path)?);
         Ok(Self {
-            db_path: db_path.to_path_buf(),
-            conn: Arc::new(Mutex::new(conn)),
+            db: Arc::new(Database::File(db_path.to_path_buf())),
             tool_router: Self::tool_router(),
         })
     }
 
     pub fn new_in_memory(conn: Connection) -> Self {
         Self {
-            db_path: PathBuf::from(":memory:"),
-            conn: Arc::new(Mutex::new(conn)),
+            db: Arc::new(Database::Memory(Mutex::new(conn))),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// Run `f` against a connection that is released as soon as it returns.
+    fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, DbError> {
+        match self.db.as_ref() {
+            Database::File(path) => {
+                let conn = crate::db::open_db_readonly(path).map_err(unavailable)?;
+                f(&conn).map_err(DbError::Query)
+            }
+            Database::Memory(conn) => {
+                let guard = conn
+                    .lock()
+                    .map_err(|e| DbError::Unavailable(e.to_string()))?;
+                f(&guard).map_err(DbError::Query)
+            }
+        }
+    }
+
     pub fn query_to_json(&self, sql: &str, params: &[&dyn duckdb::ToSql]) -> Result<Value, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        self.with_connection(|conn| self.rows_to_json(conn, sql, params))
+            .map_err(|e| e.to_string())
+    }
+
+    fn rows_to_json(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        params: &[&dyn duckdb::ToSql],
+    ) -> Result<Value, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
 
         let rows = stmt
@@ -184,10 +265,16 @@ impl HealthServer {
     /// Run `sql` and return the rows, reporting failures as a protocol-level
     /// tool error rather than a string the model has to notice is an error.
     fn rows(&self, sql: &str, params: &[&dyn duckdb::ToSql]) -> Result<Vec<Value>, McpError> {
-        match self.query_to_json(sql, params) {
+        match self.with_connection(|conn| self.rows_to_json(conn, sql, params)) {
             Ok(Value::Array(rows)) => Ok(rows),
             Ok(_) => Ok(Vec::new()),
-            Err(e) => Err(McpError::internal_error(format!("Query failed: {e}"), None)),
+            // An unavailable database is not the caller's fault, so it is
+            // reported as-is rather than framed as a bad query.
+            Err(DbError::Unavailable(message)) => Err(McpError::internal_error(message, None)),
+            Err(DbError::Query(message)) => Err(McpError::internal_error(
+                format!("Query failed: {message}"),
+                None,
+            )),
         }
     }
 
@@ -1213,5 +1300,34 @@ mod tests {
             panic!("expected the query to fail");
         };
         assert!(err.message.contains("Query failed"));
+    }
+
+    #[test]
+    fn a_locked_database_is_reported_as_an_import_in_progress() {
+        // The text DuckDB produces when another process holds the file.
+        let duckdb_error = anyhow::anyhow!(
+            "IO Error: Could not set lock on file \"/tmp/health.duckdb\": Conflicting lock is \
+             held in /usr/local/bin/apple-health-mcp (PID 123) by user someone."
+        );
+        assert!(crate::db::is_lock_conflict(&duckdb_error));
+
+        let DbError::Unavailable(message) = unavailable(duckdb_error) else {
+            panic!("a lock conflict means the database is unavailable, not a bad query");
+        };
+        assert!(message.contains("locked by another process"), "{message}");
+        assert!(message.contains("import"), "{message}");
+        // The raw DuckDB text is not useful to the model.
+        assert!(!message.contains("Conflicting lock"), "{message}");
+    }
+
+    #[test]
+    fn other_open_failures_keep_their_original_error() {
+        let err = anyhow::anyhow!("IO Error: No such file or directory");
+        assert!(!crate::db::is_lock_conflict(&err));
+
+        let DbError::Unavailable(message) = unavailable(err) else {
+            panic!("an unopenable database is unavailable");
+        };
+        assert!(message.contains("No such file or directory"), "{message}");
     }
 }

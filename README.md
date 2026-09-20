@@ -39,6 +39,8 @@ apple-health-mcp import --export-dir /path/to/apple_health_export --db ./health.
 
 This parses the XML export, ECG recordings, and GPX workout routes into a local DuckDB database. Re-running import on the same database is safe — records are deduplicated by content hash.
 
+You can re-import while an MCP client has the server loaded. The server opens the database read-only and only for the length of each query, so the file is unlocked in between and the import can take the write lock; if a query happens to be in flight, the import waits a few seconds for it. Once the import finishes, the next query sees the new data — there is no need to restart Claude. A query that lands while the import is still running gets told the database is busy rather than a raw error.
+
 ### Serve
 
 The server supports two transport modes: **HTTP** (Streamable HTTP, the default) and **stdio** (stdin/stdout, for clients that spawn the server as a subprocess — this is what the Claude Desktop bundle uses).
