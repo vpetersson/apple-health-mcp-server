@@ -45,6 +45,21 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo test --all-targets
 
+  formula:
+    name: Homebrew formula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Render the formula from a synthetic release
+        run: |
+          tag=v99.1.1
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+            printf '%064d  apple-health-mcp-%s-%s\n' 0 "$tag" "$target"
+          done > SHA256SUMS
+          scripts/update-formula.sh "$tag" SHA256SUMS rendered-formula.rb
+      - name: Check the rendered formula parses
+        run: ruby -c rendered-formula.rb
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
