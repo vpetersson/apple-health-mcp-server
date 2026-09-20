@@ -287,6 +287,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(wh, "workout_hash_1");
+
+        // The elevation/speed/course/accuracy fields all come from text nodes
+        // rather than attributes, so assert them explicitly: a regression there
+        // leaves the row count intact and silently nulls the columns.
+        let (ele, speed, course, h_acc, v_acc): (f64, f64, f64, f64, f64) = conn
+            .query_row(
+                "SELECT elevation, speed, course, h_accuracy, v_accuracy \
+                 FROM route_points ORDER BY timestamp LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(ele, 10.5);
+        assert_eq!(speed, 3.5);
+        assert_eq!(course, 180.0);
+        assert_eq!(h_acc, 5.0);
+        assert_eq!(v_acc, 3.0);
     }
 
     #[test]
