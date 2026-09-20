@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "apple-health-mcp", about = "Apple Health MCP Server")]
+#[command(name = "apple-health-mcp", about = "Apple Health MCP Server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
