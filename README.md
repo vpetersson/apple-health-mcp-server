@@ -10,10 +10,41 @@ MCP server for querying Apple Health export data. Imports your Apple Health expo
 
 ### Prerequisites
 
-- Rust toolchain (1.70+)
 - An Apple Health data export (exported from the Health app on your iPhone)
+- A Rust toolchain (1.70+), if you build from source rather than installing with Homebrew
 
-### Build & Install
+### Install
+
+**Homebrew** (prebuilt binaries for macOS on Apple Silicon and Intel, and Linux on x86_64):
+
+```bash
+brew tap vpetersson/apple-health https://github.com/vpetersson/apple-health-mcp-server
+brew install vpetersson/apple-health/apple-health-mcp
+```
+
+Since [Homebrew 6.0.0](https://brew.sh/2026/06/11/homebrew-6.0.0/), formulae from non-official
+taps have to be [trusted](https://docs.brew.sh/Tap-Trust) explicitly before Homebrew will load
+them. Installing by the fully qualified name above trusts this one formula and nothing else, so
+no separate step is needed. If you would rather install by short name afterwards, trust it first:
+
+```bash
+brew trust --formula vpetersson/apple-health/apple-health-mcp
+brew install apple-health-mcp
+```
+
+Use `brew trust --tap vpetersson/apple-health` only if you want to trust every current and future
+formula and command in the tap. In a `Brewfile`:
+
+```ruby
+tap "vpetersson/apple-health", "https://github.com/vpetersson/apple-health-mcp-server"
+brew "vpetersson/apple-health/apple-health-mcp", trusted: true
+```
+
+Upgrade with `brew upgrade apple-health-mcp`. The formula is published from the
+[releases](https://github.com/vpetersson/apple-health-mcp-server/releases) of this repository,
+so no separate tap repository is needed.
+
+**From source**:
 
 ```bash
 cargo build --release
@@ -33,10 +64,27 @@ The export directory should contain `export.xml` and optionally `electrocardiogr
 ### Import
 
 ```bash
-apple-health-mcp import --export-dir /path/to/apple_health_export --db ./health.duckdb
+apple-health-mcp import --export-dir /path/to/apple_health_export
 ```
 
 This parses the XML export, ECG recordings, and GPX workout routes into a local DuckDB database. Re-running import on the same database is safe — records are deduplicated by content hash.
+
+### Database location
+
+Without `--db`, the database path is resolved in this order:
+
+1. `$APPLE_HEALTH_MCP_DB`, if set
+2. `./health.duckdb`, if it already exists in the working directory
+3. `~/.config/apple-health-mcp/health.duckdb` (or `$XDG_CONFIG_HOME/apple-health-mcp/health.duckdb`)
+
+New installs therefore keep their data under `~/.config`, while setups that already have a
+`health.duckdb` next to them keep using it. Pass `--db /path/to/health.duckdb` to override.
+To move an existing database to the new location:
+
+```bash
+mkdir -p ~/.config/apple-health-mcp
+mv ./health.duckdb ~/.config/apple-health-mcp/
+```
 
 ### Serve
 
@@ -45,7 +93,7 @@ The server supports two transport modes: **HTTP** (Streamable HTTP, the default)
 **HTTP** (default):
 
 ```bash
-apple-health-mcp serve --db ./health.duckdb --port 8080
+apple-health-mcp serve --port 8080
 ```
 
 The MCP endpoint will be available at `http://127.0.0.1:8080/mcp`.
@@ -53,7 +101,7 @@ The MCP endpoint will be available at `http://127.0.0.1:8080/mcp`.
 **stdio**:
 
 ```bash
-apple-health-mcp serve --db ./health.duckdb --transport stdio
+apple-health-mcp serve --transport stdio
 ```
 
 The server reads JSON-RPC messages from stdin and writes responses to stdout. This is typically invoked by the MCP client directly (see Claude Desktop config below).
@@ -94,7 +142,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "apple-health": {
       "command": "apple-health-mcp",
-      "args": ["serve", "--db", "/path/to/health.duckdb", "--transport", "stdio"]
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }
