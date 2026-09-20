@@ -36,8 +36,8 @@ return the hashes that `get_workout_details`, `get_workout_route`, and `get_ecg_
 5. `run_custom_query` runs arbitrary read-only SQL (SELECT/WITH) when the dedicated tools \
 do not fit — useful for joins and correlations across tables.
 
-Dates are ISO 8601 (YYYY-MM-DD). Values are in Apple's units, reported per row in the \
-`unit` column. Raw exports commonly hold millions of rows, so filter by type and date \
+Date filters take `YYYY-MM-DD`; returned timestamps are `YYYY-MM-DD HH:MM:SS` in UTC. \
+Values are in Apple's units, reported per row in the `unit` column. Raw exports commonly hold millions of rows, so filter by type and date \
 range rather than scanning.";
 
 /// Render a DuckDB TIMESTAMP as `YYYY-MM-DD HH:MM:SS[.ffffff]`.
