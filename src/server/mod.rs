@@ -429,7 +429,11 @@ impl HealthServer {
     }
 }
 
-#[tool_handler]
+// rmcp 3.x changed the default `#[tool_handler]` router expression from
+// `self.tool_router` to `Self::tool_router()`, which would rebuild the router
+// (and regenerate every tool's JSON schema) on each request. Point it back at
+// the field so the router is still built once per server.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for HealthServer {}
 
 pub async fn run_server(db_path: &Path, host: &str, port: u16, transport: &str) -> Result<()> {
