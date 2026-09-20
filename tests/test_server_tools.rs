@@ -37,7 +37,7 @@ fn server_in_memory_query() {
     let conn = open_db_in_memory().unwrap();
     ensure_schema(&conn).unwrap();
     conn.execute_batch(
-        "INSERT INTO records VALUES ('rh1', 'HKQuantityTypeIdentifierHeartRate', 72.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');",
+        "INSERT INTO records VALUES ('rh1', 'HKQuantityTypeIdentifierHeartRate', 72.0, NULL, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');",
     ).unwrap();
     rebuild_daily_stats(&conn).unwrap();
 
@@ -98,7 +98,7 @@ fn server_queries_all_tables() {
     ensure_schema(&conn).unwrap();
     conn.execute_batch(
         "
-        INSERT INTO records VALUES ('rh1', 'HeartRate', 72.0, 'bpm', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
+        INSERT INTO records VALUES ('rh1', 'HeartRate', 72.0, NULL, 'bpm', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
         INSERT INTO workouts VALUES ('wh1', 'Running', 1800.0, 'sec', 5000.0, 'm', 300.0, 'kcal', 'Watch', NULL, NULL, NULL, '2024-01-01 10:00:00', '2024-01-01 10:30:00', 'imp1');
         INSERT INTO activity_summaries VALUES ('2024-01-01', 500.0, 600.0, 45.0, 30.0, 30.0, 30.0, 10.0, 12.0, 'imp1');
         INSERT INTO ecg_readings VALUES ('ecg1', '2024-01-01 12:00:00', 'Normal', 'Watch', 512.0, NULL, '2.0', 'imp1');

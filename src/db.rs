@@ -25,6 +25,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             record_hash     VARCHAR,
             record_type     VARCHAR NOT NULL,
             value           DOUBLE,
+            text_value      VARCHAR,
             unit            VARCHAR,
             source_name     VARCHAR,
             source_version  VARCHAR,
@@ -276,9 +277,9 @@ mod tests {
         // Insert duplicate records
         conn.execute_batch(
             "
-            INSERT INTO records VALUES ('hash1', 'HeartRate', 72.0, 'count/min', 'Watch', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
-            INSERT INTO records VALUES ('hash1', 'HeartRate', 72.0, 'count/min', 'Watch', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
-            INSERT INTO records VALUES ('hash2', 'StepCount', 100.0, 'count', 'Phone', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
+            INSERT INTO records VALUES ('hash1', 'HeartRate', 72.0, NULL, 'count/min', 'Watch', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
+            INSERT INTO records VALUES ('hash1', 'HeartRate', 72.0, NULL, 'count/min', 'Watch', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
+            INSERT INTO records VALUES ('hash2', 'StepCount', 100.0, NULL, 'count', 'Phone', '1.0', NULL, '2024-01-01 00:00:00', '2024-01-01 00:00:00', '2024-01-01 00:01:00', 'imp1');
             ",
         )
         .unwrap();
@@ -296,9 +297,9 @@ mod tests {
         let conn = setup();
         conn.execute_batch(
             "
-            INSERT INTO records VALUES ('h1', 'HeartRate', 72.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
-            INSERT INTO records VALUES ('h2', 'HeartRate', 80.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 09:00:00', '2024-01-01 09:01:00', 'imp1');
-            INSERT INTO records VALUES ('h3', 'HeartRate', 65.0, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-02 08:00:00', '2024-01-02 08:01:00', 'imp1');
+            INSERT INTO records VALUES ('h1', 'HeartRate', 72.0, NULL, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00', '2024-01-01 08:01:00', 'imp1');
+            INSERT INTO records VALUES ('h2', 'HeartRate', 80.0, NULL, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 09:00:00', '2024-01-01 09:01:00', 'imp1');
+            INSERT INTO records VALUES ('h3', 'HeartRate', 65.0, NULL, 'count/min', 'Watch', NULL, NULL, NULL, '2024-01-02 08:00:00', '2024-01-02 08:01:00', 'imp1');
             ",
         )
         .unwrap();
