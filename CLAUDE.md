@@ -27,6 +27,10 @@ cargo run -- serve --db ./health.duckdb --port 8080 --host 127.0.0.1
 
 The MCP endpoint is at `http://<host>:<port>/mcp`.
 
+## Versioning
+
+CalVer, `YY.MM.MICRO` (`26.9.0` = first release of September 2026). Months are not zero-padded — Cargo requires a valid SemVer string and SemVer rejects leading zeros. To cut a release: bump `version` in `Cargo.toml`, refresh `Cargo.lock` with `cargo update -p apple-health-mcp`, merge to `master`, then push a `vYY.MM.MICRO` tag. The tag triggers `.github/workflows/release.yml`, which builds the Linux and macOS binaries and creates the GitHub release.
+
 ## Architecture
 
 **CLI** (`src/main.rs`): Two subcommands via clap — `import` and `serve`.

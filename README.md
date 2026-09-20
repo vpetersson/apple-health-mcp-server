@@ -129,3 +129,13 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
   }
 }
 ```
+
+## Versioning
+
+apple-health-mcp uses calendar versioning in the form `YY.MM.MICRO` — the year, the month, and a counter for releases cut within that month. `26.9.0` is the first release of September 2026, superseding `0.1.0`. Months are not zero-padded, so the version is also a valid SemVer string that Cargo can parse and order.
+
+The version says when a build was cut, not what it guarantees about compatibility. Breaking changes are called out in the release notes.
+
+Releases are tagged `vYY.MM.MICRO`. Each tag builds binaries for Linux (x86_64) and macOS (Apple Silicon and Intel) and attaches them, with a `SHA256SUMS` file, to the [GitHub release](https://github.com/vpetersson/apple-health-mcp-server/releases).
+
+To cut a release: bump `version` in `Cargo.toml`, refresh `Cargo.lock` with `cargo update -p apple-health-mcp`, merge to `master`, then push a `vYY.MM.MICRO` tag.
