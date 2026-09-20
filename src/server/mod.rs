@@ -1,54 +1,188 @@
+pub mod results;
 pub mod tools;
 
 use anyhow::Result;
-use duckdb::types::ValueRef;
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta};
+use duckdb::types::{TimeUnit, ValueRef};
 use duckdb::Connection;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
-use serde_json::{json, Value};
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use results::{EcgData, RowSet, WorkoutDetails};
 use tools::*;
+
+/// Sent to the client in the `initialize` response. Clients surface this to the
+/// model before any tool is called, so it is the cheapest place to teach the
+/// discovery-first workflow the tools expect.
+const INSTRUCTIONS: &str = "\
+Query a local DuckDB database built from an Apple Health export. Everything is read-only.
+
+Workflow:
+1. Call `list_record_types` first — it names the record types this export actually \
+contains (Apple's HK identifiers, e.g. HKQuantityTypeIdentifierHeartRate) with counts \
+and date ranges. Do not guess type names.
+2. For trends and summaries prefer `get_record_statistics`, which reads a pre-aggregated \
+table and is far cheaper than pulling raw rows.
+3. Use `query_records` only when individual samples matter; it is capped at 1000 rows.
+4. Workouts, ECGs, and routes are reached by hash: `list_workouts` / `list_ecg_readings` \
+return the hashes that `get_workout_details`, `get_workout_route`, and `get_ecg_data` take.
+5. `run_custom_query` runs arbitrary read-only SQL (SELECT/WITH) when the dedicated tools \
+do not fit — useful for joins and correlations across tables.
+
+Date filters take `YYYY-MM-DD`; returned timestamps are `YYYY-MM-DD HH:MM:SS` in UTC. \
+Values are in Apple's units, reported per row in the `unit` column. Raw exports commonly hold millions of rows, so filter by type and date \
+range rather than scanning.";
+
+/// Render a DuckDB TIMESTAMP as `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+///
+/// DuckDB's own `String` conversion rejects temporal columns, so without these
+/// helpers every date in the export is silently dropped from tool output. The
+/// space-separated form matches both what the importer writes and what the
+/// tools' date filters compare against.
+fn timestamp_to_string(unit: TimeUnit, value: i64) -> Option<String> {
+    let dt = DateTime::from_timestamp_micros(unit.to_micros(value))?;
+    Some(dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string())
+}
+
+/// Render a DuckDB DATE (days since the Unix epoch) as `YYYY-MM-DD`.
+fn date32_to_string(days: i32) -> Option<String> {
+    NaiveDate::from_ymd_opt(1970, 1, 1)?
+        .checked_add_signed(TimeDelta::days(i64::from(days)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+}
+
+/// Render a DuckDB TIME as `HH:MM:SS[.ffffff]`.
+fn time64_to_string(unit: TimeUnit, value: i64) -> Option<String> {
+    let micros = unit.to_micros(value);
+    let secs = u32::try_from(micros.div_euclid(1_000_000)).ok()?;
+    let nanos = u32::try_from(micros.rem_euclid(1_000_000)).ok()? * 1000;
+    NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+        .map(|t| t.format("%H:%M:%S%.f").to_string())
+}
+
+/// Where the server reads health data from.
+enum Database {
+    /// A database file, reopened for each query and closed again straight away.
+    ///
+    /// DuckDB locks the file for as long as *any* connection is open, read-only
+    /// included, and refuses a read-write open from another process while that
+    /// lock is held. Holding one connection for the lifetime of the session
+    /// would therefore block `apple-health-mcp import` for as long as the
+    /// client stayed connected — which, now that the server is installed as a
+    /// Claude Desktop bundle, is all the time. Reopening costs a few
+    /// milliseconds even on a multi-gigabyte database, so the file sits
+    /// unlocked between queries and an import can take the write lock.
+    ///
+    /// Reopening also means a finished import is picked up on the next query,
+    /// with no need to restart the client.
+    File(PathBuf),
+    /// An owned in-memory database: nothing to lock, and no file to reopen
+    /// from, so the connection is kept for the lifetime of the server.
+    Memory(Mutex<Connection>),
+}
+
+/// Why a read against the database did not produce rows.
+enum DbError {
+    /// The database could not be opened at all — most often because an import
+    /// holds the write lock. Nothing is wrong with the query.
+    Unavailable(String),
+    /// The database opened but the query itself failed.
+    Query(String),
+}
+
+/// Explain a failed read-only open in terms the caller can act on.
+fn unavailable(err: anyhow::Error) -> DbError {
+    DbError::Unavailable(if crate::db::is_lock_conflict(&err) {
+        "The health database is locked by another process. An import is probably running — \
+         try again once it finishes."
+            .to_string()
+    } else {
+        format!("Cannot open the health database: {err}")
+    })
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbError::Unavailable(message) => f.write_str(message),
+            DbError::Query(message) => f.write_str(message),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct HealthServer {
-    db_path: PathBuf,
-    conn: Arc<Mutex<Connection>>,
+    db: Arc<Database>,
     tool_router: ToolRouter<Self>,
 }
 
 impl std::fmt::Debug for HealthServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db_path: &dyn std::fmt::Debug = match self.db.as_ref() {
+            Database::File(path) => path,
+            Database::Memory(_) => &":memory:",
+        };
         f.debug_struct("HealthServer")
-            .field("db_path", &self.db_path)
+            .field("db_path", db_path)
             .finish()
     }
 }
 
 impl HealthServer {
     pub fn new(db_path: &Path) -> Result<Self> {
-        let conn = crate::db::open_db_readonly(db_path)?;
+        // Open once so a missing or unreadable database fails at startup
+        // rather than on the first tool call, then let it go again.
+        drop(crate::db::open_db_readonly(db_path)?);
         Ok(Self {
-            db_path: db_path.to_path_buf(),
-            conn: Arc::new(Mutex::new(conn)),
+            db: Arc::new(Database::File(db_path.to_path_buf())),
             tool_router: Self::tool_router(),
         })
     }
 
     pub fn new_in_memory(conn: Connection) -> Self {
         Self {
-            db_path: PathBuf::from(":memory:"),
-            conn: Arc::new(Mutex::new(conn)),
+            db: Arc::new(Database::Memory(Mutex::new(conn))),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// Run `f` against a connection that is released as soon as it returns.
+    fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, DbError> {
+        match self.db.as_ref() {
+            Database::File(path) => {
+                let conn = crate::db::open_db_readonly(path).map_err(unavailable)?;
+                f(&conn).map_err(DbError::Query)
+            }
+            Database::Memory(conn) => {
+                let guard = conn
+                    .lock()
+                    .map_err(|e| DbError::Unavailable(e.to_string()))?;
+                f(&guard).map_err(DbError::Query)
+            }
+        }
+    }
+
     pub fn query_to_json(&self, sql: &str, params: &[&dyn duckdb::ToSql]) -> Result<Value, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        self.with_connection(|conn| self.rows_to_json(conn, sql, params))
+            .map_err(|e| e.to_string())
+    }
+
+    fn rows_to_json(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        params: &[&dyn duckdb::ToSql],
+    ) -> Result<Value, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
 
         let rows = stmt
@@ -95,9 +229,22 @@ impl HealthServer {
                         Ok(ValueRef::Text(bytes)) => {
                             Value::String(String::from_utf8_lossy(bytes).into_owned())
                         }
+                        Ok(ValueRef::Timestamp(unit, v)) => match timestamp_to_string(unit, v) {
+                            Some(s) => Value::String(s),
+                            None => continue,
+                        },
+                        Ok(ValueRef::Date32(days)) => match date32_to_string(days) {
+                            Some(s) => Value::String(s),
+                            None => continue,
+                        },
+                        Ok(ValueRef::Time64(unit, v)) => match time64_to_string(unit, v) {
+                            Some(s) => Value::String(s),
+                            None => continue,
+                        },
+                        Ok(ValueRef::Decimal(d)) => Value::String(d.to_string()),
                         Ok(_) => {
-                            // Timestamp, Date32, Time64, Decimal, Interval, etc.
-                            // Fall back to string via DuckDB's own formatting
+                            // Interval, Blob, List, Struct, etc. Fall back to
+                            // string via DuckDB's own formatting.
                             match row.get::<_, String>(i) {
                                 Ok(s) => Value::String(s),
                                 Err(_) => continue,
@@ -114,25 +261,61 @@ impl HealthServer {
         let results: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
         Ok(Value::Array(results))
     }
+
+    /// Run `sql` and return the rows, reporting failures as a protocol-level
+    /// tool error rather than a string the model has to notice is an error.
+    fn rows(&self, sql: &str, params: &[&dyn duckdb::ToSql]) -> Result<Vec<Value>, McpError> {
+        match self.with_connection(|conn| self.rows_to_json(conn, sql, params)) {
+            Ok(Value::Array(rows)) => Ok(rows),
+            Ok(_) => Ok(Vec::new()),
+            // An unavailable database is not the caller's fault, so it is
+            // reported as-is rather than framed as a bad query.
+            Err(DbError::Unavailable(message)) => Err(McpError::internal_error(message, None)),
+            Err(DbError::Query(message)) => Err(McpError::internal_error(
+                format!("Query failed: {message}"),
+                None,
+            )),
+        }
+    }
+
+    /// [`Self::rows`] wrapped as the structured result the tabular tools return.
+    fn row_set(&self, sql: &str, params: &[&dyn duckdb::ToSql]) -> Result<Json<RowSet>, McpError> {
+        Ok(Json(RowSet::new(self.rows(sql, params)?)))
+    }
+
+    /// Run `sql` and return its single row, if any.
+    fn first_row(
+        &self,
+        sql: &str,
+        params: &[&dyn duckdb::ToSql],
+    ) -> Result<Option<Value>, McpError> {
+        Ok(self.rows(sql, params)?.into_iter().next())
+    }
 }
 
 #[tool_router]
 impl HealthServer {
     #[tool(
-        description = "List all available health record types with counts and date ranges. Use this first to discover what data is available. Returns: type (e.g. HKQuantityTypeIdentifierHeartRate, HKQuantityTypeIdentifierStepCount), count, unit, earliest_date, latest_date."
+        title = "List record types",
+        description = "List all available health record types with counts and date ranges. Use this first to discover what data is available. Returns: type (e.g. HKQuantityTypeIdentifierHeartRate, HKQuantityTypeIdentifierStepCount), count, unit, earliest_date, latest_date.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn list_record_types(&self) -> String {
-        let sql = "SELECT record_type as type, COUNT(*) as count, unit, MIN(start_date) as earliest_date, MAX(start_date) as latest_date FROM records GROUP BY record_type, unit ORDER BY count DESC";
-        match self.query_to_json(sql, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+    async fn list_record_types(&self) -> Result<Json<RowSet>, McpError> {
+        self.row_set(
+            "SELECT record_type as type, COUNT(*) as count, unit, MIN(start_date) as earliest_date, MAX(start_date) as latest_date FROM records GROUP BY record_type, unit ORDER BY count DESC",
+            &[],
+        )
     }
 
     #[tool(
-        description = "Query individual health records. Returns: record_hash, record_type, value (numeric measurement), unit, source_name, start_date, end_date. Record types use Apple's HK identifiers (e.g. HKQuantityTypeIdentifierHeartRate). Use list_record_types first to discover available types."
+        title = "Query records",
+        description = "Query individual health records. Returns: record_hash, record_type, value (numeric measurement), unit, source_name, start_date, end_date. Record types use Apple's HK identifiers (e.g. HKQuantityTypeIdentifierHeartRate). Use list_record_types first to discover available types.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn query_records(&self, params: Parameters<QueryRecordsParams>) -> String {
+    async fn query_records(
+        &self,
+        params: Parameters<QueryRecordsParams>,
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
         let limit = params.limit.unwrap_or(100).min(1000);
         let mut sql = String::from(
@@ -151,23 +334,31 @@ impl HealthServer {
         }
         sql.push_str(&format!(" ORDER BY start_date DESC LIMIT {}", limit));
 
-        match self.query_to_json(&sql, &[&record_type as &dyn duckdb::ToSql]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        self.row_set(&sql, &[&record_type as &dyn duckdb::ToSql])
     }
 
     #[tool(
-        description = "Get aggregated statistics for a record type over time periods. Returns: period, count, avg_value, min_value, max_value, sum_value. Uses pre-computed daily_record_stats table for fast aggregation. Prefer this over query_records for trends and summaries."
+        title = "Get record statistics",
+        description = "Get aggregated statistics for a record type over time periods. Returns: period, count, avg_value, min_value, max_value, sum_value. Uses pre-computed daily_record_stats table for fast aggregation. Prefer this over query_records for trends and summaries.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn get_record_statistics(&self, params: Parameters<GetRecordStatisticsParams>) -> String {
+    async fn get_record_statistics(
+        &self,
+        params: Parameters<GetRecordStatisticsParams>,
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
         let period = params.period.as_deref().unwrap_or("day");
         let date_trunc = match period {
+            "day" => "date",
             "week" => "DATE_TRUNC('week', date)",
             "month" => "DATE_TRUNC('month', date)",
             "year" => "DATE_TRUNC('year', date)",
-            _ => "date",
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("Unknown period '{other}'. Expected day, week, month, or year."),
+                    None,
+                ))
+            }
         };
 
         let mut sql = format!(
@@ -189,16 +380,18 @@ impl HealthServer {
         }
         sql.push_str(&format!(" GROUP BY {} ORDER BY period", date_trunc));
 
-        match self.query_to_json(&sql, &[&record_type as &dyn duckdb::ToSql]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        self.row_set(&sql, &[&record_type as &dyn duckdb::ToSql])
     }
 
     #[tool(
-        description = "List workouts with optional filtering. Returns: workout_hash, activity_type (e.g. HKWorkoutActivityTypeRunning), duration, duration_unit, total_distance, total_distance_unit, total_energy_burned, total_energy_unit, source_name, start_date, end_date. Use workout_hash with get_workout_details or get_workout_route."
+        title = "List workouts",
+        description = "List workouts with optional filtering. Returns: workout_hash, activity_type (e.g. HKWorkoutActivityTypeRunning), duration, duration_unit, total_distance, total_distance_unit, total_energy_burned, total_energy_unit, source_name, start_date, end_date. Use workout_hash with get_workout_details or get_workout_route.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn list_workouts(&self, params: Parameters<ListWorkoutsParams>) -> String {
+    async fn list_workouts(
+        &self,
+        params: Parameters<ListWorkoutsParams>,
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
         let limit = params.limit.unwrap_or(50).min(500);
         let mut sql = String::from(
@@ -221,68 +414,58 @@ impl HealthServer {
         }
         sql.push_str(&format!(" ORDER BY start_date DESC LIMIT {}", limit));
 
-        match self.query_to_json(&sql, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        self.row_set(&sql, &[])
     }
 
     #[tool(
-        description = "Get full workout details by workout_hash. Returns: workout object (all fields), events (lap/pause markers), statistics (per-metric breakdowns like heart rate zones), and has_route boolean. Get the workout_hash from list_workouts."
+        title = "Get workout details",
+        description = "Get full workout details by workout_hash. Returns: workout object (all fields), events (lap/pause markers), statistics (per-metric breakdowns like heart rate zones), and has_route boolean. Get the workout_hash from list_workouts.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn get_workout_details(&self, params: Parameters<GetWorkoutDetailsParams>) -> String {
+    async fn get_workout_details(
+        &self,
+        params: Parameters<GetWorkoutDetailsParams>,
+    ) -> Result<Json<WorkoutDetails>, McpError> {
         let Parameters(params) = params;
         let hash = params.workout_hash;
+        let hash_param = &[&hash as &dyn duckdb::ToSql];
 
-        let workout = match self.query_to_json(
-            "SELECT * FROM workouts WHERE workout_hash = ?",
-            &[&hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {}", e),
-        };
-
-        let events = match self.query_to_json(
+        let workout =
+            self.first_row("SELECT * FROM workouts WHERE workout_hash = ?", hash_param)?;
+        let events = self.rows(
             "SELECT event_type, date, duration, duration_unit FROM workout_events WHERE workout_hash = ?",
-            &[&hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {}", e),
-        };
-
-        let statistics = match self.query_to_json(
+            hash_param,
+        )?;
+        let statistics = self.rows(
             "SELECT stat_type, start_date, end_date, average, minimum, maximum, sum, unit FROM workout_statistics WHERE workout_hash = ?",
-            &[&hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {}", e),
-        };
+            hash_param,
+        )?;
+        let has_route = self
+            .first_row(
+                "SELECT COUNT(*) as count FROM route_points WHERE workout_hash = ?",
+                hash_param,
+            )?
+            .and_then(|r| r.get("count").and_then(Value::as_i64))
+            .unwrap_or(0)
+            > 0;
 
-        let has_route = match self.query_to_json(
-            "SELECT COUNT(*) as count FROM route_points WHERE workout_hash = ?",
-            &[&hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {}", e),
-        };
-
-        let result = json!({
-            "workout": workout.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
-            "events": events,
-            "statistics": statistics,
-            "has_route": has_route.as_array().and_then(|a| a.first()).and_then(|r| r.get("count")).and_then(|c| c.as_i64()).unwrap_or(0) > 0,
-        });
-
-        serde_json::to_string_pretty(&result).unwrap_or_default()
+        Ok(Json(WorkoutDetails {
+            workout,
+            events,
+            statistics,
+            has_route,
+        }))
     }
 
     #[tool(
-        description = "Get Apple Watch activity ring data. Returns: date_components, active_energy_burned, active_energy_burned_goal, apple_exercise_time, apple_exercise_time_goal, apple_stand_hours, apple_stand_hours_goal. Values are in kcal, minutes, and hours respectively."
+        title = "Get activity summaries",
+        description = "Get Apple Watch activity ring data. Returns: date_components, active_energy_burned, active_energy_burned_goal, apple_exercise_time, apple_exercise_time_goal, apple_stand_hours, apple_stand_hours_goal. Values are in kcal, minutes, and hours respectively.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn get_activity_summaries(
         &self,
         params: Parameters<GetActivitySummariesParams>,
-    ) -> String {
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
         let limit = params.limit.unwrap_or(30).min(365);
         let mut sql = String::from("SELECT * FROM activity_summaries WHERE 1=1");
@@ -301,30 +484,34 @@ impl HealthServer {
         }
         sql.push_str(&format!(" ORDER BY date_components DESC LIMIT {}", limit));
 
-        match self.query_to_json(&sql, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        self.row_set(&sql, &[])
     }
 
     #[tool(
-        description = "Get GPS route data for a workout. Returns array of: latitude, longitude, elevation (meters), timestamp, speed (m/s), course (degrees). Use get_workout_details first to check has_route."
+        title = "Get workout route",
+        description = "Get GPS route data for a workout. Returns rows of: latitude, longitude, elevation (meters), timestamp, speed (m/s), course (degrees). Use get_workout_details first to check has_route.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn get_workout_route(&self, params: Parameters<GetWorkoutRouteParams>) -> String {
+    async fn get_workout_route(
+        &self,
+        params: Parameters<GetWorkoutRouteParams>,
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
-        match self.query_to_json(
+        self.row_set(
             "SELECT latitude, longitude, elevation, timestamp, speed, course FROM route_points WHERE workout_hash = ? ORDER BY timestamp",
             &[&params.workout_hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        )
     }
 
     #[tool(
-        description = "List ECG recordings. Returns: ecg_hash, recorded_date, classification (e.g. SinusRhythm, AtrialFibrillation), device, sample_rate_hz. Use ecg_hash with get_ecg_data."
+        title = "List ECG readings",
+        description = "List ECG recordings. Returns: ecg_hash, recorded_date, classification (e.g. SinusRhythm, AtrialFibrillation), device, sample_rate_hz. Use ecg_hash with get_ecg_data.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn list_ecg_readings(&self, params: Parameters<ListEcgReadingsParams>) -> String {
+    async fn list_ecg_readings(
+        &self,
+        params: Parameters<ListEcgReadingsParams>,
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
         let mut sql = String::from(
             "SELECT ecg_hash, recorded_date, classification, device, sample_rate_hz FROM ecg_readings WHERE 1=1",
@@ -343,94 +530,101 @@ impl HealthServer {
         }
         sql.push_str(" ORDER BY recorded_date DESC");
 
-        match self.query_to_json(&sql, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        self.row_set(&sql, &[])
     }
 
     #[tool(
-        description = "Get full ECG waveform by ecg_hash. Returns: reading (metadata), sample_count, voltages_uv (array of voltage values in microvolts). Get ecg_hash from list_ecg_readings."
+        title = "Get ECG waveform",
+        description = "Get full ECG waveform by ecg_hash. Returns: reading (metadata), sample_count, voltages_uv (array of voltage values in microvolts). Get ecg_hash from list_ecg_readings.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn get_ecg_data(&self, params: Parameters<GetEcgDataParams>) -> String {
+    async fn get_ecg_data(
+        &self,
+        params: Parameters<GetEcgDataParams>,
+    ) -> Result<Json<EcgData>, McpError> {
         let Parameters(params) = params;
         let hash = params.ecg_hash;
-        let metadata = match self.query_to_json(
-            "SELECT * FROM ecg_readings WHERE ecg_hash = ?",
-            &[&hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {}", e),
-        };
+        let hash_param = &[&hash as &dyn duckdb::ToSql];
 
-        let samples = match self.query_to_json(
-            "SELECT voltage_uv FROM ecg_samples WHERE ecg_hash = ? ORDER BY sample_idx",
-            &[&hash as &dyn duckdb::ToSql],
-        ) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {}", e),
-        };
+        let reading =
+            self.first_row("SELECT * FROM ecg_readings WHERE ecg_hash = ?", hash_param)?;
+        let voltages: Vec<Value> = self
+            .rows(
+                "SELECT voltage_uv FROM ecg_samples WHERE ecg_hash = ? ORDER BY sample_idx",
+                hash_param,
+            )?
+            .iter()
+            .filter_map(|r| r.get("voltage_uv").cloned())
+            .collect();
 
-        let voltages: Vec<Value> = samples
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|r| r.get("voltage_uv").cloned())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let result = json!({
-            "reading": metadata.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
-            "sample_count": voltages.len(),
-            "voltages_uv": voltages,
-        });
-
-        serde_json::to_string_pretty(&result).unwrap_or_default()
+        Ok(Json(EcgData {
+            reading,
+            sample_count: voltages.len(),
+            voltages_uv: voltages,
+        }))
     }
 
     #[tool(
-        description = "Run a read-only SQL query (DuckDB dialect). Must start with SELECT or WITH. Tables: records (record_hash, record_type, value, unit, source_name, device, start_date, end_date), workouts (workout_hash, activity_type, duration, total_distance, total_energy_burned, start_date, end_date), workout_events, workout_statistics, activity_summaries, ecg_readings, ecg_samples, route_points (latitude, longitude, elevation, timestamp, speed), daily_record_stats (record_type, date, unit, count, avg_value, min_value, max_value, sum_value), record_metadata (record_hash, key, value), imports."
+        title = "Run custom SQL query",
+        description = "Run a read-only SQL query (DuckDB dialect). Must start with SELECT or WITH. Tables: records (record_hash, record_type, value, unit, source_name, device, start_date, end_date), workouts (workout_hash, activity_type, duration, total_distance, total_energy_burned, start_date, end_date), workout_events, workout_statistics, activity_summaries, ecg_readings, ecg_samples, route_points (latitude, longitude, elevation, timestamp, speed), daily_record_stats (record_type, date, unit, count, avg_value, min_value, max_value, sum_value), record_metadata (record_hash, key, value), imports.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn run_custom_query(&self, params: Parameters<RunCustomQueryParams>) -> String {
+    async fn run_custom_query(
+        &self,
+        params: Parameters<RunCustomQueryParams>,
+    ) -> Result<Json<RowSet>, McpError> {
         let Parameters(params) = params;
         let trimmed = params.query.trim().to_string();
         let upper = trimmed.to_uppercase();
         if !upper.starts_with("SELECT") && !upper.starts_with("WITH") {
-            return "Error: Query must start with SELECT or WITH".to_string();
+            return Err(McpError::invalid_params(
+                "Query must start with SELECT or WITH",
+                None,
+            ));
         }
 
-        match self.query_to_json(&trimmed, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+        self.row_set(&trimmed, &[])
     }
 
     #[tool(
-        description = "List all devices and apps that contributed health data. Returns: source_name, record_count, earliest_date, latest_date."
+        title = "List data sources",
+        description = "List all devices and apps that contributed health data. Returns: source_name, record_count, earliest_date, latest_date.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn list_data_sources(&self) -> String {
-        let sql = "SELECT source_name, COUNT(*) as record_count, MIN(start_date) as earliest_date, MAX(start_date) as latest_date FROM records GROUP BY source_name ORDER BY record_count DESC";
-        match self.query_to_json(sql, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+    async fn list_data_sources(&self) -> Result<Json<RowSet>, McpError> {
+        self.row_set(
+            "SELECT source_name, COUNT(*) as record_count, MIN(start_date) as earliest_date, MAX(start_date) as latest_date FROM records GROUP BY source_name ORDER BY record_count DESC",
+            &[],
+        )
     }
 
     #[tool(
-        description = "List all data imports. Returns: import_id, export_dir, imported_at, record_count, workout_count, duration_secs."
+        title = "Get import history",
+        description = "List all data imports. Returns: import_id, export_dir, imported_at, record_count, workout_count, duration_secs.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn get_import_history(&self) -> String {
-        let sql = "SELECT * FROM imports ORDER BY imported_at DESC";
-        match self.query_to_json(sql, &[]) {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            Err(e) => format!("Error: {}", e),
-        }
+    async fn get_import_history(&self) -> Result<Json<RowSet>, McpError> {
+        self.row_set("SELECT * FROM imports ORDER BY imported_at DESC", &[])
     }
 }
 
-#[tool_handler]
-impl ServerHandler for HealthServer {}
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for HealthServer {
+    fn get_info(&self) -> ServerConfig {
+        // `Implementation::from_build_env()` reports rmcp's own crate name and
+        // version, not ours, so identify the server explicitly.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                    .with_title("Apple Health")
+                    .with_description(
+                        "Read-only access to an Apple Health export imported into DuckDB.",
+                    )
+                    .with_website_url("https://github.com/vpetersson/apple-health-mcp-server"),
+            )
+            .with_instructions(INSTRUCTIONS)
+    }
+}
 
 pub async fn run_server(db_path: &Path, host: &str, port: u16, transport: &str) -> Result<()> {
     match transport {
@@ -482,7 +676,8 @@ async fn run_http_server(db_path: &Path, host: &str, port: u16) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::{ensure_schema, open_db_in_memory, rebuild_daily_stats};
-    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::handler::server::wrapper::{Json, Parameters};
+    use serde_json::json;
 
     fn setup_server() -> HealthServer {
         let conn = open_db_in_memory().unwrap();
@@ -608,8 +803,6 @@ mod tests {
 
     #[test]
     fn query_to_json_timestamp_raw() {
-        // Raw timestamps may be skipped if the DuckDB driver can't convert them to String.
-        // This tests that the query still succeeds even with timestamp columns.
         let server = setup_server();
         let result = server
             .query_to_json(
@@ -619,6 +812,59 @@ mod tests {
             .unwrap();
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
+        // DuckDB cannot convert a TIMESTAMP to String on its own, so an
+        // unhandled variant would drop the column entirely.
+        assert_eq!(
+            arr[0].get("start_date").unwrap(),
+            "2024-01-01 08:00:00",
+            "timestamp columns must survive the conversion"
+        );
+    }
+
+    #[test]
+    fn query_to_json_temporal_types() {
+        let server = setup_server();
+        let result = server
+            .query_to_json(
+                "SELECT DATE '2024-01-15' AS d, \
+                 TIME '13:45:30.5' AS t, \
+                 TIMESTAMP '2024-01-15 13:45:30.25' AS ts, \
+                 1234.56::DECIMAL(10,2) AS dec",
+                &[],
+            )
+            .unwrap();
+        let obj = result.as_array().unwrap()[0].as_object().unwrap();
+        assert_eq!(obj["d"], "2024-01-15");
+        assert_eq!(obj["t"], "13:45:30.500");
+        assert_eq!(obj["ts"], "2024-01-15 13:45:30.250");
+        assert_eq!(obj["dec"], "1234.56");
+    }
+
+    #[test]
+    fn query_to_json_timestamp_before_epoch() {
+        let server = setup_server();
+        let result = server
+            .query_to_json(
+                "SELECT TIMESTAMP '1969-07-20 20:17:40' AS ts, DATE '1900-01-01' AS d",
+                &[],
+            )
+            .unwrap();
+        let obj = result.as_array().unwrap()[0].as_object().unwrap();
+        assert_eq!(obj["ts"], "1969-07-20 20:17:40");
+        assert_eq!(obj["d"], "1900-01-01");
+    }
+
+    #[test]
+    fn tool_rows_include_dates() {
+        let server = setup_server();
+        let rows = server
+            .rows(
+                "SELECT start_date, end_date FROM records WHERE record_hash = 'rh1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get("start_date").unwrap(), "2024-01-01 08:00:00");
+        assert_eq!(rows[0].get("end_date").unwrap(), "2024-01-01 08:01:00");
     }
 
     #[test]
@@ -631,10 +877,8 @@ mod tests {
     #[tokio::test]
     async fn tool_list_record_types() {
         let server = setup_server();
-        let result = server.list_record_types().await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let arr = parsed.as_array().unwrap();
-        assert_eq!(arr.len(), 2); // HeartRate and StepCount
+        let Json(result) = server.list_record_types().await.unwrap();
+        assert_eq!(result.row_count, 2); // HeartRate and StepCount
     }
 
     #[tokio::test]
@@ -647,9 +891,8 @@ mod tests {
             source_name: None,
             limit: Some(10),
         });
-        let result = server.query_records(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        let Json(result) = server.query_records(params).await.unwrap();
+        assert_eq!(result.row_count, 2);
     }
 
     #[tokio::test]
@@ -662,9 +905,8 @@ mod tests {
             source_name: Some("Apple Watch".to_string()),
             limit: None,
         });
-        let result = server.query_records(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.query_records(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -676,9 +918,8 @@ mod tests {
             end_date: None,
             period: Some("day".to_string()),
         });
-        let result = server.get_record_statistics(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(!parsed.as_array().unwrap().is_empty());
+        let Json(result) = server.get_record_statistics(params).await.unwrap();
+        assert!(!result.rows.is_empty());
     }
 
     #[tokio::test]
@@ -690,9 +931,8 @@ mod tests {
             end_date: None,
             limit: None,
         });
-        let result = server.list_workouts(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.list_workouts(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -701,12 +941,11 @@ mod tests {
         let params = Parameters(GetWorkoutDetailsParams {
             workout_hash: "wh1".to_string(),
         });
-        let result = server.get_workout_details(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("workout").unwrap().is_object());
-        assert!(parsed.get("events").unwrap().is_array());
-        assert!(parsed.get("statistics").unwrap().is_array());
-        assert_eq!(parsed.get("has_route").unwrap(), &Value::Bool(true));
+        let Json(result) = server.get_workout_details(params).await.unwrap();
+        assert!(result.workout.is_some());
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.statistics.len(), 1);
+        assert!(result.has_route);
     }
 
     #[tokio::test]
@@ -717,9 +956,8 @@ mod tests {
             end_date: None,
             limit: None,
         });
-        let result = server.get_activity_summaries(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.get_activity_summaries(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -728,9 +966,8 @@ mod tests {
         let params = Parameters(GetWorkoutRouteParams {
             workout_hash: "wh1".to_string(),
         });
-        let result = server.get_workout_route(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        let Json(result) = server.get_workout_route(params).await.unwrap();
+        assert_eq!(result.row_count, 2);
     }
 
     #[tokio::test]
@@ -740,9 +977,8 @@ mod tests {
             start_date: None,
             end_date: None,
         });
-        let result = server.list_ecg_readings(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.list_ecg_readings(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -751,13 +987,9 @@ mod tests {
         let params = Parameters(GetEcgDataParams {
             ecg_hash: "ecg1".to_string(),
         });
-        let result = server.get_ecg_data(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.get("sample_count").unwrap(), 3);
-        assert_eq!(
-            parsed.get("voltages_uv").unwrap().as_array().unwrap().len(),
-            3
-        );
+        let Json(result) = server.get_ecg_data(params).await.unwrap();
+        assert_eq!(result.sample_count, 3);
+        assert_eq!(result.voltages_uv.len(), 3);
     }
 
     #[tokio::test]
@@ -766,9 +998,8 @@ mod tests {
         let params = Parameters(RunCustomQueryParams {
             query: "SELECT COUNT(*) as cnt FROM records".to_string(),
         });
-        let result = server.run_custom_query(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap()[0].get("cnt").unwrap(), 3);
+        let Json(result) = server.run_custom_query(params).await.unwrap();
+        assert_eq!(result.rows[0].get("cnt").unwrap(), 3);
     }
 
     #[tokio::test]
@@ -777,9 +1008,8 @@ mod tests {
         let params = Parameters(RunCustomQueryParams {
             query: "WITH t AS (SELECT 1 as n) SELECT n FROM t".to_string(),
         });
-        let result = server.run_custom_query(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.run_custom_query(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -788,8 +1018,10 @@ mod tests {
         let params = Parameters(RunCustomQueryParams {
             query: "DROP TABLE records".to_string(),
         });
-        let result = server.run_custom_query(params).await;
-        assert!(result.starts_with("Error: Query must start with SELECT or WITH"));
+        let Err(err) = server.run_custom_query(params).await else {
+            panic!("expected the query to be rejected");
+        };
+        assert!(err.message.contains("must start with SELECT or WITH"));
     }
 
     #[tokio::test]
@@ -798,25 +1030,24 @@ mod tests {
         let params = Parameters(RunCustomQueryParams {
             query: "INSERT INTO records VALUES ('a','b',1,'c','d',NULL,NULL,NULL,'2024-01-01','2024-01-01','x')".to_string(),
         });
-        let result = server.run_custom_query(params).await;
-        assert!(result.starts_with("Error: Query must start with SELECT or WITH"));
+        let Err(err) = server.run_custom_query(params).await else {
+            panic!("expected the query to be rejected");
+        };
+        assert!(err.message.contains("must start with SELECT or WITH"));
     }
 
     #[tokio::test]
     async fn tool_list_data_sources() {
         let server = setup_server();
-        let result = server.list_data_sources().await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let arr = parsed.as_array().unwrap();
-        assert_eq!(arr.len(), 2); // Apple Watch, iPhone
+        let Json(result) = server.list_data_sources().await.unwrap();
+        assert_eq!(result.row_count, 2); // Apple Watch, iPhone
     }
 
     #[tokio::test]
     async fn tool_get_import_history() {
         let server = setup_server();
-        let result = server.get_import_history().await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.get_import_history().await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[test]
@@ -883,17 +1114,6 @@ mod tests {
         assert!(obj["d"].is_string());
     }
 
-    #[test]
-    fn query_to_json_date_type() {
-        let server = setup_server();
-        // DATE type goes through the catch-all branch
-        let result = server
-            .query_to_json("SELECT DATE '2024-01-15' AS d", &[])
-            .unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-    }
-
     #[tokio::test]
     async fn tool_run_server_invalid_transport() {
         let dir = tempfile::tempdir().unwrap();
@@ -929,9 +1149,8 @@ mod tests {
             end_date: Some("2024-12-31".to_string()),
             limit: Some(10),
         });
-        let result = server.list_workouts(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.list_workouts(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -942,9 +1161,8 @@ mod tests {
             end_date: Some("2024-12-31".to_string()),
             limit: Some(10),
         });
-        let result = server.get_activity_summaries(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.get_activity_summaries(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -954,9 +1172,8 @@ mod tests {
             start_date: Some("2024-01-01".to_string()),
             end_date: Some("2024-12-31".to_string()),
         });
-        let result = server.list_ecg_readings(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        let Json(result) = server.list_ecg_readings(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -969,9 +1186,8 @@ mod tests {
                 end_date: None,
                 period: Some(period.to_string()),
             });
-            let result = server.get_record_statistics(params).await;
-            let parsed: Value = serde_json::from_str(&result).unwrap();
-            assert!(!parsed.as_array().unwrap().is_empty());
+            let Json(result) = server.get_record_statistics(params).await.unwrap();
+            assert!(!result.rows.is_empty());
         }
     }
 
@@ -981,9 +1197,137 @@ mod tests {
         let params = Parameters(GetWorkoutDetailsParams {
             workout_hash: "nonexistent".to_string(),
         });
-        let result = server.get_workout_details(params).await;
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("workout").unwrap().is_null());
-        assert_eq!(parsed.get("has_route").unwrap(), &Value::Bool(false));
+        let Json(result) = server.get_workout_details(params).await.unwrap();
+        assert!(result.workout.is_none());
+        assert!(!result.has_route);
+    }
+
+    #[test]
+    fn server_info_identifies_this_crate() {
+        let server = setup_server();
+        let info = ServerHandler::get_info(&server);
+
+        // rmcp's `Implementation::from_build_env()` would report "rmcp" here.
+        assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.server_info.title.as_deref(), Some("Apple Health"));
+        assert!(info.server_info.website_url.is_some());
+        assert!(info.capabilities.tools.is_some());
+
+        let instructions = info.instructions.expect("instructions are advertised");
+        assert!(instructions.contains("list_record_types"));
+        assert!(instructions.contains("read-only"));
+    }
+
+    #[test]
+    fn every_tool_is_annotated_read_only_with_an_output_schema() {
+        let tools = HealthServer::tool_router().list_all();
+        assert_eq!(tools.len(), 12);
+
+        for tool in &tools {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+            assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+            assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name);
+            assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+
+            assert!(tool.title.is_some(), "{} has no title", tool.name);
+            assert!(
+                tool.description.is_some(),
+                "{} has no description",
+                tool.name
+            );
+
+            let schema = tool
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no output schema", tool.name));
+            assert_eq!(
+                schema.get("type").and_then(Value::as_str),
+                Some("object"),
+                "{} output schema is not an object",
+                tool.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_results_carry_structured_content() {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+        use rmcp::model::CallToolResponse;
+
+        let server = setup_server();
+        let result = server.list_record_types().await.unwrap();
+
+        let CallToolResponse::Complete(result) = result.into_call_tool_result().unwrap() else {
+            panic!("expected a completed tool result");
+        };
+        let structured = result
+            .structured_content
+            .expect("structuredContent is populated");
+        assert_eq!(structured.get("row_count").unwrap(), 2);
+        assert_eq!(structured.get("rows").unwrap().as_array().unwrap().len(), 2);
+
+        // Clients without structured-output support still get the JSON as text.
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn tool_get_record_statistics_rejects_unknown_period() {
+        let server = setup_server();
+        let params = Parameters(GetRecordStatisticsParams {
+            record_type: "HKQuantityTypeIdentifierHeartRate".to_string(),
+            start_date: None,
+            end_date: None,
+            period: Some("fortnight".to_string()),
+        });
+        let Err(err) = server.get_record_statistics(params).await else {
+            panic!("expected an unknown period to be rejected");
+        };
+        assert!(err.message.contains("Unknown period 'fortnight'"));
+    }
+
+    #[tokio::test]
+    async fn tool_reports_query_failure_as_an_error() {
+        let server = setup_server();
+        let params = Parameters(RunCustomQueryParams {
+            query: "SELECT * FROM no_such_table".to_string(),
+        });
+        let Err(err) = server.run_custom_query(params).await else {
+            panic!("expected the query to fail");
+        };
+        assert!(err.message.contains("Query failed"));
+    }
+
+    #[test]
+    fn a_locked_database_is_reported_as_an_import_in_progress() {
+        // The text DuckDB produces when another process holds the file.
+        let duckdb_error = anyhow::anyhow!(
+            "IO Error: Could not set lock on file \"/tmp/health.duckdb\": Conflicting lock is \
+             held in /usr/local/bin/apple-health-mcp (PID 123) by user someone."
+        );
+        assert!(crate::db::is_lock_conflict(&duckdb_error));
+
+        let DbError::Unavailable(message) = unavailable(duckdb_error) else {
+            panic!("a lock conflict means the database is unavailable, not a bad query");
+        };
+        assert!(message.contains("locked by another process"), "{message}");
+        assert!(message.contains("import"), "{message}");
+        // The raw DuckDB text is not useful to the model.
+        assert!(!message.contains("Conflicting lock"), "{message}");
+    }
+
+    #[test]
+    fn other_open_failures_keep_their_original_error() {
+        let err = anyhow::anyhow!("IO Error: No such file or directory");
+        assert!(!crate::db::is_lock_conflict(&err));
+
+        let DbError::Unavailable(message) = unavailable(err) else {
+            panic!("an unopenable database is unavailable");
+        };
+        assert!(message.contains("No such file or directory"), "{message}");
     }
 }

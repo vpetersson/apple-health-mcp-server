@@ -27,6 +27,14 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features
 
+  bundle:
+    name: Validate MCP bundle manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - run: bunx --bun @anthropic-ai/mcpb@2 validate mcpb/manifest.json
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
@@ -53,12 +61,23 @@ jobs:
       - name: Render the formula from a synthetic release
         run: |
           tag=v99.1.1
+          # A real release also carries the .mcpb bundles, whose names share the
+          # binaries' prefix. Include them so this catches a formula lookup that
+          # stops distinguishing the two.
           for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
             printf '%064d  apple-health-mcp-%s-%s\n' 0 "$tag" "$target"
+            printf '%064d  apple-health-mcp-%s-%s.mcpb\n' 1 "$tag" "$target"
           done > SHA256SUMS
           scripts/update-formula.sh "$tag" SHA256SUMS rendered-formula.rb
       - name: Check the rendered formula parses
         run: ruby -c rendered-formula.rb
+      - name: Check it staged the binaries, not the bundles
+        run: |
+          if grep -q 'sha256 "0\{63\}1"' rendered-formula.rb; then
+            echo "::error::formula picked up a .mcpb checksum instead of the binary"
+            exit 1
+          fi
+          grep -q 'sha256 "0\{64\}"' rendered-formula.rb
 
   coverage:
     name: Coverage

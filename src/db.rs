@@ -1,15 +1,68 @@
 use anyhow::Result;
 use duckdb::{AccessMode, Config, Connection};
 use std::path::Path;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
+/// How long [`open_db`] waits for another process to release the database.
+///
+/// The MCP server holds the file only for the length of a single query, so a
+/// conflict means an import started while a query happened to be in flight.
+/// Waiting a few seconds rides that out; waiting longer would just hang an
+/// import behind a client that is genuinely busy.
+const WRITE_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// DuckDB allows exactly one writer and no concurrent readers *across
+/// processes*, and reports the clash in the error message — there is no
+/// distinct error code to match on.
+pub fn is_lock_conflict(err: &anyhow::Error) -> bool {
+    err.to_string().contains("Conflicting lock")
+}
+
+/// Open the database read-write, waiting out a reader that is mid-query.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
+    let deadline = Instant::now() + WRITE_LOCK_WAIT;
+    let mut waited = false;
+    loop {
+        match open_db_once(db_path) {
+            Ok(conn) => {
+                if waited {
+                    info!("Database lock released, continuing");
+                }
+                return Ok(conn);
+            }
+            Err(e) if is_lock_conflict(&e) && Instant::now() < deadline => {
+                if !waited {
+                    warn!(
+                        "Database is locked by another process (an MCP client mid-query?); \
+                         waiting up to {}s",
+                        WRITE_LOCK_WAIT.as_secs()
+                    );
+                    waited = true;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) if is_lock_conflict(&e) => {
+                return Err(e.context(
+                    "another process is holding the database open; stop it and retry the import",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn open_db_once(db_path: &Path) -> Result<Connection> {
     let config = Config::default().access_mode(AccessMode::ReadWrite)?;
     let conn = Connection::open_with_flags(db_path, config)?;
     conn.execute_batch("PRAGMA threads=4;")?;
     Ok(conn)
 }
 
+/// Open the database read-only.
+///
+/// This still takes a lock, so callers must not hold the connection open any
+/// longer than a single query — see `server::Database`.
 pub fn open_db_readonly(db_path: &Path) -> Result<Connection> {
     let config = Config::default().access_mode(AccessMode::ReadOnly)?;
     let conn = Connection::open_with_flags(db_path, config)?;

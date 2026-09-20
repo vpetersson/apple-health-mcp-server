@@ -11,7 +11,7 @@ MCP server for querying Apple Health export data. Imports your Apple Health expo
 ### Prerequisites
 
 - An Apple Health data export (exported from the Health app on your iPhone)
-- A Rust toolchain (1.70+), if you build from source rather than installing with Homebrew
+- A Rust toolchain (1.88+, the MSRV of the `rmcp` SDK), if you build from source rather than installing with Homebrew
 
 ### Install
 
@@ -69,6 +69,8 @@ apple-health-mcp import --export-dir /path/to/apple_health_export
 
 This parses the XML export, ECG recordings, and GPX workout routes into a local DuckDB database. Re-running import on the same database is safe — records are deduplicated by content hash.
 
+You can re-import while an MCP client has the server loaded. The server opens the database read-only and only for the length of each query, so the file is unlocked in between and the import can take the write lock; if a query happens to be in flight, the import waits a few seconds for it. Once the import finishes, the next query sees the new data — there is no need to restart Claude. A query that lands while the import is still running gets told the database is busy rather than a raw error.
+
 ### Database location
 
 Without `--db`, the database path is resolved in this order:
@@ -88,7 +90,7 @@ mv ./health.duckdb ~/.config/apple-health-mcp/
 
 ### Serve
 
-The server supports two transport modes: **HTTP** (Streamable HTTP, the default) and **stdio** (stdin/stdout, for clients like Claude Desktop that spawn the server as a subprocess).
+The server supports two transport modes: **HTTP** (Streamable HTTP, the default) and **stdio** (stdin/stdout, for clients that spawn the server as a subprocess — this is what the Claude Desktop bundle uses).
 
 **HTTP** (default):
 
@@ -108,6 +110,9 @@ The server reads JSON-RPC messages from stdin and writes responses to stdout. Th
 
 ## MCP Tools
 
+All tools are read-only. The tabular ones return `{ row_count, rows }`; `get_workout_details` and `get_ecg_data` return their own object shapes. Each tool's exact
+output schema is published in `tools/list`.
+
 | Tool | Description |
 |------|-------------|
 | `list_record_types` | List all health record types with counts and date ranges |
@@ -125,17 +130,36 @@ The server reads JSON-RPC messages from stdin and writes responses to stdout. Th
 
 ## Client Configuration
 
-For HTTP-based clients, make sure the server is running before connecting. Stdio-based clients (Claude Desktop) launch the server automatically.
+The server speaks MCP revision **2026-07-28** (falling back to 2025-11-25 for clients that
+still use the `initialize` handshake) and every tool publishes an `outputSchema`, so
+responses arrive as `structuredContent` rather than a wall of text. Tools are annotated
+read-only, which lets clients skip approval prompts for them.
 
-### Claude Code
+### Claude Desktop (one-click, recommended)
+
+Claude Desktop installs local MCP servers as **MCP bundles** (`.mcpb`, formerly `.dxt`)
+rather than hand-edited JSON. Each release attaches a per-platform bundle:
+
+1. Build the database once: `apple-health-mcp import --export-dir /path/to/apple_health_export`
+2. Download `apple-health-mcp-<version>-<target>.mcpb` from the
+   [releases page](https://github.com/vpetersson/apple-health-mcp-server/releases).
+3. Open **Settings → Extensions** in Claude Desktop and drag the `.mcpb` file in.
+4. **Health database** is prefilled with `~/.config/apple-health-mcp/health.duckdb`, where step 1
+   puts it. Change it only if you imported somewhere else.
+
+The bundle carries the server binary, so there is nothing else to install. To build one
+yourself from a local checkout:
 
 ```bash
-claude mcp add apple-health --transport streamable-http http://127.0.0.1:8080/mcp
+cargo build --release
+./scripts/build-mcpb.sh target/release/apple-health-mcp dist/apple-health-mcp.mcpb
 ```
 
-### Claude Desktop
+<details>
+<summary>Manual JSON configuration (still supported)</summary>
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -146,6 +170,25 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
     }
   }
 }
+```
+
+</details>
+
+### Claude Desktop / Claude.ai as a remote connector
+
+To reach a server you are already running over HTTP, add it as a **custom connector**
+(**Settings → Connectors → Add custom connector**) pointing at `http://127.0.0.1:8080/mcp`.
+Use the bundle above for a local database — a connector is the right shape when the server
+runs somewhere else.
+
+### Claude Code
+
+```bash
+# stdio — Claude Code starts the server for you
+claude mcp add apple-health -- apple-health-mcp serve --db /path/to/health.duckdb --transport stdio
+
+# or against an already-running HTTP server
+claude mcp add --transport http apple-health http://127.0.0.1:8080/mcp
 ```
 
 ### Cursor
@@ -184,6 +227,6 @@ apple-health-mcp uses calendar versioning in the form `YY.MM.MICRO` — the year
 
 The version says when a build was cut, not what it guarantees about compatibility. Breaking changes are called out in the release notes.
 
-Releases are tagged `vYY.MM.MICRO`. Each tag builds binaries for Linux (x86_64) and macOS (Apple Silicon and Intel) and attaches them, with a `SHA256SUMS` file, to the [GitHub release](https://github.com/vpetersson/apple-health-mcp-server/releases).
+Releases are tagged `vYY.MM.MICRO`. Each tag builds binaries for Linux (x86_64) and macOS (Apple Silicon and Intel), packages each one as a Claude Desktop `.mcpb` bundle, and attaches both — with a `SHA256SUMS` file — to the [GitHub release](https://github.com/vpetersson/apple-health-mcp-server/releases).
 
 To cut a release: bump `version` in `Cargo.toml`, refresh `Cargo.lock` with `cargo update -p apple-health-mcp`, merge to `master`, then push a `vYY.MM.MICRO` tag.

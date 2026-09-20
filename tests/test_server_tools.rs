@@ -131,3 +131,106 @@ fn server_queries_all_tables() {
         assert!(cnt >= 1, "Table {} should have data", table);
     }
 }
+
+/// Regression guard: DuckDB refuses to convert TIMESTAMP columns to `String`,
+/// so an unhandled temporal variant drops every date from every tool response.
+#[test]
+fn imported_dates_survive_into_tool_output() {
+    let conn = open_db_in_memory().unwrap();
+    ensure_schema(&conn).unwrap();
+    let xml_dir = tempfile::tempdir().unwrap();
+    std::fs::write(xml_dir.path().join("export.xml"), common::MINIMAL_XML).unwrap();
+    import_xml(&conn, &xml_dir.path().join("export.xml"), "test").unwrap();
+    rebuild_daily_stats(&conn).unwrap();
+
+    let server = HealthServer::new_in_memory(conn);
+    let result = server
+        .query_to_json(
+            "SELECT start_date, end_date FROM records ORDER BY start_date",
+            &[],
+        )
+        .unwrap();
+    let rows = result.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let start = row
+            .get("start_date")
+            .unwrap_or_else(|| panic!("start_date missing from {row}"));
+        assert!(start.as_str().unwrap().starts_with("2024-01-01"), "{start}");
+        assert!(row.get("end_date").is_some(), "end_date missing from {row}");
+    }
+
+    // The daily stats table stores DATE, not TIMESTAMP — a separate ValueRef variant.
+    let stats = server
+        .query_to_json("SELECT date FROM daily_record_stats LIMIT 1", &[])
+        .unwrap();
+    assert_eq!(
+        stats.as_array().unwrap()[0].get("date").unwrap(),
+        "2024-01-01"
+    );
+}
+
+/// An in-memory database has no file to lock, so its connection is kept.
+#[test]
+fn in_memory_server_still_serves_queries() {
+    let conn = open_db_in_memory().unwrap();
+    ensure_schema(&conn).unwrap();
+    let server = HealthServer::new_in_memory(conn);
+    for _ in 0..3 {
+        let result = server.query_to_json("SELECT 1 AS one", &[]).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 1);
+    }
+    assert!(format!("{server:?}").contains(":memory:"));
+}
+
+/// `HealthServer::new` opens the database once to validate it, so a bad path
+/// fails at startup rather than on the first tool call.
+#[test]
+fn missing_database_fails_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(HealthServer::new(&dir.path().join("does-not-exist.duckdb")).is_err());
+}
+
+/// A file-backed server reopens per query, so data written between queries is
+/// picked up without reconstructing the server.
+#[test]
+fn file_backed_server_sees_later_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("health.duckdb");
+    {
+        let conn = open_db(&db_path).unwrap();
+        ensure_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO records VALUES ('rh1', 'HKQuantityTypeIdentifierHeartRate', 72.0,
+             'count/min', 'Watch', NULL, NULL, NULL, '2024-01-01 08:00:00',
+             '2024-01-01 08:01:00', 'imp1');",
+        )
+        .unwrap();
+    }
+
+    let server = HealthServer::new(&db_path).unwrap();
+    assert_eq!(count_records(&server), 1);
+
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO records VALUES ('rh2', 'HKQuantityTypeIdentifierBodyMass', 70.0, 'kg',
+             'Scale', NULL, NULL, NULL, '2024-02-01 08:00:00', '2024-02-01 08:00:00', 'imp2');",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(count_records(&server), 2);
+}
+
+fn count_records(server: &HealthServer) -> i64 {
+    server
+        .query_to_json("SELECT COUNT(*) AS cnt FROM records", &[])
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("cnt")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
