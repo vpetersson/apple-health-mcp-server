@@ -53,8 +53,12 @@ pub fn run_import(export_dir: &Path, db_path: &Path) -> Result<()> {
 
     // Phase 6: Log import metadata
     let duration = start.elapsed();
+    // `imported_at` is written explicitly rather than left to its DEFAULT:
+    // phase 4 rebuilds `imports` with `CREATE OR REPLACE TABLE ... AS SELECT`,
+    // which keeps the column but drops the `DEFAULT CURRENT_TIMESTAMP` behind
+    // it, so relying on the default silently records every import as NULL.
     conn.execute(
-        "INSERT INTO imports (import_id, export_dir, record_count, workout_count, duration_secs) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO imports (import_id, export_dir, imported_at, record_count, workout_count, duration_secs) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)",
         duckdb::params![
             import_id,
             export_dir.to_string_lossy().to_string(),
