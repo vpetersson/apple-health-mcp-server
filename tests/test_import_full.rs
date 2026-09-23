@@ -236,3 +236,62 @@ fn run_import_xml_only() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+/// A database written by an older version keeps whatever columns it had —
+/// `CREATE TABLE IF NOT EXISTS` never touches an existing table. The Appender
+/// binds by position, so the import used to die on the first flush with
+/// `invalid timestamp field format: "import_..."`, the import id having landed
+/// in a TIMESTAMP column.
+#[test]
+fn run_import_over_a_database_from_an_older_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_dir = dir.path().join("export");
+    std::fs::create_dir_all(&export_dir).unwrap();
+    std::fs::write(export_dir.join("export.xml"), common::MINIMAL_XML).unwrap();
+
+    let db_path = dir.path().join("legacy.duckdb");
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE records (
+                record_hash VARCHAR, record_type VARCHAR, value DOUBLE, unit VARCHAR,
+                source_name VARCHAR, source_version VARCHAR, device VARCHAR,
+                creation_date TIMESTAMP, start_date TIMESTAMP, end_date TIMESTAMP,
+                imported_at TIMESTAMP);",
+        )
+        .unwrap();
+    }
+
+    run_import(&export_dir, &db_path).unwrap();
+
+    let conn = open_db(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+/// Phase 4 rebuilds `imports` with `CREATE OR REPLACE TABLE ... AS SELECT`,
+/// which drops the `DEFAULT CURRENT_TIMESTAMP` on `imported_at`, so every
+/// import — the first one included — used to be recorded with a NULL timestamp.
+#[test]
+fn every_import_records_when_it_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_dir = dir.path().join("export");
+    std::fs::create_dir_all(&export_dir).unwrap();
+    std::fs::write(export_dir.join("export.xml"), common::MINIMAL_XML).unwrap();
+
+    let db_path = dir.path().join("imports.duckdb");
+    run_import(&export_dir, &db_path).unwrap();
+    run_import(&export_dir, &db_path).unwrap();
+
+    let conn = open_db(&db_path).unwrap();
+    let dated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM imports WHERE imported_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dated, 2);
+}
