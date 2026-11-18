@@ -293,6 +293,17 @@ impl HealthServer {
     }
 }
 
+/// `AND <column> <= <end>` for a TIMESTAMP column. A bare `YYYY-MM-DD` would
+/// cast to midnight and silently drop everything later that day, so a date-only
+/// value is treated as inclusive of the whole day.
+fn end_date_filter(column: &str, end: &str) -> String {
+    if NaiveDate::parse_from_str(end, "%Y-%m-%d").is_ok() {
+        format!(" AND {column} < CAST('{end}' AS DATE) + INTERVAL 1 DAY")
+    } else {
+        format!(" AND {column} <= '{}'", end.replace('\'', "''"))
+    }
+}
+
 #[tool_router]
 impl HealthServer {
     #[tool(
@@ -327,7 +338,7 @@ impl HealthServer {
             sql.push_str(&format!(" AND start_date >= '{}'", sd.replace('\'', "''")));
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(" AND end_date <= '{}'", ed.replace('\'', "''")));
+            sql.push_str(&end_date_filter("end_date", ed));
         }
         if let Some(ref sn) = params.source_name {
             sql.push_str(&format!(" AND source_name = '{}'", sn.replace('\'', "''")));
@@ -410,7 +421,7 @@ impl HealthServer {
             sql.push_str(&format!(" AND start_date >= '{}'", sd.replace('\'', "''")));
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(" AND end_date <= '{}'", ed.replace('\'', "''")));
+            sql.push_str(&end_date_filter("end_date", ed));
         }
         sql.push_str(&format!(" ORDER BY start_date DESC LIMIT {}", limit));
 
@@ -523,10 +534,7 @@ impl HealthServer {
             ));
         }
         if let Some(ref ed) = params.end_date {
-            sql.push_str(&format!(
-                " AND recorded_date <= '{}'",
-                ed.replace('\'', "''")
-            ));
+            sql.push_str(&end_date_filter("recorded_date", ed));
         }
         sql.push_str(" ORDER BY recorded_date DESC");
 
@@ -906,6 +914,60 @@ mod tests {
             limit: None,
         });
         let Json(result) = server.query_records(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
+    }
+
+    // Both heart rate records end on 2024-01-01 after midnight; a date-only
+    // end_date must include the whole day rather than cast to 00:00:00.
+    #[tokio::test]
+    async fn tool_query_records_date_only_end_includes_whole_day() {
+        let server = setup_server();
+        let params = Parameters(QueryRecordsParams {
+            record_type: "HKQuantityTypeIdentifierHeartRate".to_string(),
+            start_date: None,
+            end_date: Some("2024-01-01".to_string()),
+            source_name: None,
+            limit: None,
+        });
+        let Json(result) = server.query_records(params).await.unwrap();
+        assert_eq!(result.row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn tool_query_records_timestamp_end_is_exact() {
+        let server = setup_server();
+        let params = Parameters(QueryRecordsParams {
+            record_type: "HKQuantityTypeIdentifierHeartRate".to_string(),
+            start_date: None,
+            end_date: Some("2024-01-01 08:30:00".to_string()),
+            source_name: None,
+            limit: None,
+        });
+        let Json(result) = server.query_records(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_list_workouts_date_only_end_includes_whole_day() {
+        let server = setup_server();
+        let params = Parameters(ListWorkoutsParams {
+            activity_type: None,
+            start_date: None,
+            end_date: Some("2024-01-01".to_string()),
+            limit: None,
+        });
+        let Json(result) = server.list_workouts(params).await.unwrap();
+        assert_eq!(result.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_list_ecg_readings_date_only_end_includes_whole_day() {
+        let server = setup_server();
+        let params = Parameters(ListEcgReadingsParams {
+            start_date: None,
+            end_date: Some("2024-01-01".to_string()),
+        });
+        let Json(result) = server.list_ecg_readings(params).await.unwrap();
         assert_eq!(result.row_count, 1);
     }
 
